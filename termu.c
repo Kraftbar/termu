@@ -952,6 +952,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 paste_clipboard_text();
                 return 0;
             }
+            if (wp == 'W') {
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                return 0;
+            }
         }
         if ((GetKeyState(VK_CONTROL) & 0x8000) && wp == VK_HOME) {
             set_scroll_offset(g_history_count);
