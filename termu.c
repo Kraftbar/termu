@@ -58,6 +58,7 @@ static int g_cur_bg_index = -1;
 static int g_cur_fg_bright = 0;
 static int g_cur_bg_bright = 0;
 static int g_bold = 0;
+static int g_reverse = 0;
 static Cell g_screen[MAX_ROWS][MAX_COLS];
 static Cell g_history[MAX_HISTORY][MAX_COLS];
 static int g_history_start = 0;
@@ -123,10 +124,18 @@ static void schedule_terminal_repaint(void) {
     }
 }
 
-static void clear_cell(Cell* c) {
+static void set_blank_cell(Cell* c, COLORREF fg, COLORREF bg) {
     c->ch = L' ';
-    c->fg = DEFAULT_FG;
-    c->bg = DEFAULT_BG;
+    c->fg = fg;
+    c->bg = bg;
+}
+
+static void clear_cell(Cell* c) {
+    set_blank_cell(c, DEFAULT_FG, DEFAULT_BG);
+}
+
+static void erase_cell(Cell* c) {
+    set_blank_cell(c, g_cur_fg, g_cur_bg);
 }
 
 static void clear_line(Cell* line) {
@@ -221,32 +230,44 @@ static void clear_screen(void) {
 
 static void clear_line_from_cursor(void) {
     for (int x = g_cx; x < g_cols; x++) {
-        clear_cell(&g_screen[g_cy][x]);
+        erase_cell(&g_screen[g_cy][x]);
     }
 }
 
 static void clear_line_to_cursor(void) {
     for (int x = 0; x <= g_cx && x < g_cols; x++) {
-        clear_cell(&g_screen[g_cy][x]);
+        erase_cell(&g_screen[g_cy][x]);
     }
 }
 
 static void clear_entire_line(void) {
     for (int x = 0; x < g_cols; x++) {
-        clear_cell(&g_screen[g_cy][x]);
+        erase_cell(&g_screen[g_cy][x]);
+    }
+}
+
+static void erase_chars_from_cursor(int count) {
+    int end = g_cx + count;
+    if (end > g_cols) end = g_cols;
+    for (int x = g_cx; x < end; x++) {
+        erase_cell(&g_screen[g_cy][x]);
     }
 }
 
 static void clear_screen_from_cursor(void) {
     clear_line_from_cursor();
     for (int y = g_cy + 1; y < g_rows; y++) {
-        clear_line(g_screen[y]);
+        for (int x = 0; x < g_cols; x++) {
+            erase_cell(&g_screen[y][x]);
+        }
     }
 }
 
 static void clear_screen_to_cursor(void) {
     for (int y = 0; y < g_cy; y++) {
-        clear_line(g_screen[y]);
+        for (int x = 0; x < g_cols; x++) {
+            erase_cell(&g_screen[y][x]);
+        }
     }
     clear_line_to_cursor();
 }
@@ -330,16 +351,27 @@ static COLORREF ansi_color(int index, int bright) {
 }
 
 static void refresh_text_attrs(void) {
+    COLORREF fg;
+    COLORREF bg;
+
     if (g_cur_fg_index >= 0) {
-        g_cur_fg = ansi_color(g_cur_fg_index, g_cur_fg_bright || g_bold);
+        fg = ansi_color(g_cur_fg_index, g_cur_fg_bright || g_bold);
     } else {
-        g_cur_fg = DEFAULT_FG;
+        fg = DEFAULT_FG;
     }
 
     if (g_cur_bg_index >= 0) {
-        g_cur_bg = ansi_color(g_cur_bg_index, g_cur_bg_bright);
+        bg = ansi_color(g_cur_bg_index, g_cur_bg_bright);
     } else {
-        g_cur_bg = DEFAULT_BG;
+        bg = DEFAULT_BG;
+    }
+
+    if (g_reverse) {
+        g_cur_fg = bg;
+        g_cur_bg = fg;
+    } else {
+        g_cur_fg = fg;
+        g_cur_bg = bg;
     }
 }
 
@@ -349,6 +381,7 @@ static void reset_text_attrs(void) {
     g_cur_fg_bright = 0;
     g_cur_bg_bright = 0;
     g_bold = 0;
+    g_reverse = 0;
     refresh_text_attrs();
 }
 
@@ -360,6 +393,12 @@ static void handle_sgr_param(int p) {
         refresh_text_attrs();
     } else if (p == 22) {
         g_bold = 0;
+        refresh_text_attrs();
+    } else if (p == 7) {
+        g_reverse = 1;
+        refresh_text_attrs();
+    } else if (p == 27) {
+        g_reverse = 0;
         refresh_text_attrs();
     } else if (p == 39) {
         g_cur_fg_index = -1;
@@ -428,11 +467,12 @@ static void handle_sgr(const char* seq, int len) {
 }
 
 static void handle_csi(const char* seq, int len) {
+    char cmd = len > 0 ? seq[len - 1] : 0;
     int private_seq = len > 0 && seq[0] == '?';
     int i = private_seq ? 1 : 0;
-    int a = parse_num(seq, &i, 1);
+    int default_a = (cmd == 'J' || cmd == 'K') ? 0 : 1;
+    int a = parse_num(seq, &i, default_a);
     int b = 1;
-    char cmd = len > 0 ? seq[len - 1] : 0;
 
     if (cmd == 'm') {
         handle_sgr(seq, len);
@@ -487,6 +527,9 @@ static void handle_csi(const char* seq, int len) {
         if (a == 0) clear_line_from_cursor();
         if (a == 1) clear_line_to_cursor();
         if (a == 2) clear_entire_line();
+        break;
+    case 'X':
+        erase_chars_from_cursor(a);
         break;
     case 's':
         g_saved_cx = g_cx;
