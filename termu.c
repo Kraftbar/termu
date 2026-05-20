@@ -25,6 +25,10 @@
 #define START_COLS 100
 #define DEFAULT_FG RGB(230, 230, 230)
 #define DEFAULT_BG RGB(12, 16, 20)
+#define HOST_PANEL_W 140
+#define TAB_BAR_H 26
+#define TERM_PAD 6
+#define HOST_ROW_H 22
 
 typedef struct {
     WCHAR ch;
@@ -86,6 +90,13 @@ static int g_sel_focus_y = 0;
 static int g_word_anchor_start_x = 0;
 static int g_word_anchor_end_x = 0;
 static int g_word_anchor_y = 0;
+static const WCHAR* g_hosts[] = {
+    L"Local cmd",
+    L"nybo-linux",
+    L"web01",
+    L"router"
+};
+#define HOST_COUNT ((int)(sizeof(g_hosts) / sizeof(g_hosts[0])))
 
 static void die_box(const WCHAR* text) {
     MessageBoxW(NULL, text, APP_NAME, MB_OK | MB_ICONERROR);
@@ -102,6 +113,12 @@ static void fill_icon_rect(DWORD* pixels, int x, int y, int w, int h, DWORD colo
             }
         }
     }
+}
+
+static void fill_solid_rect(HDC dc, const RECT* rc, COLORREF color) {
+    HBRUSH brush = CreateSolidBrush(color);
+    FillRect(dc, rc, brush);
+    DeleteObject(brush);
 }
 
 static HICON create_app_icon(void) {
@@ -775,14 +792,45 @@ static void feed_output(const char* bytes, DWORD count) {
     schedule_terminal_repaint();
 }
 
-static void mouse_to_cell(LPARAM lp, int* cell_x, int* cell_y) {
+static void get_terminal_rect(HWND hwnd, RECT* term) {
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    term->left = rc.left + HOST_PANEL_W + TERM_PAD;
+    term->top = rc.top + TAB_BAR_H + TERM_PAD;
+    term->right = rc.right - TERM_PAD;
+    term->bottom = rc.bottom - TERM_PAD;
+    if (term->right < term->left) term->right = term->left;
+    if (term->bottom < term->top) term->bottom = term->top;
+}
+
+static int point_in_terminal(HWND hwnd, LPARAM lp) {
+    RECT term;
     int px = (int)(short)LOWORD(lp);
     int py = (int)(short)HIWORD(lp);
-    int x = (px - 8) / g_char_w;
-    int y = (py - 8) / g_char_h;
+    get_terminal_rect(hwnd, &term);
+    return px >= term.left && px < term.right && py >= term.top && py < term.bottom;
+}
 
-    if (px < 8) x = 0;
-    if (py < 8) y = 0;
+static void handle_chrome_click(HWND hwnd, LPARAM lp) {
+    (void)lp;
+    g_selection_active = 0;
+    SetFocus(hwnd);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static void mouse_to_cell(LPARAM lp, int* cell_x, int* cell_y) {
+    RECT term;
+    int px = (int)(short)LOWORD(lp);
+    int py = (int)(short)HIWORD(lp);
+    int x;
+    int y;
+
+    get_terminal_rect(g_hwnd, &term);
+    x = (px - term.left) / g_char_w;
+    y = (py - term.top) / g_char_h;
+
+    if (px < term.left) x = 0;
+    if (py < term.top) y = 0;
     if (x < 0) x = 0;
     if (y < 0) y = 0;
     if (x >= g_cols) x = g_cols - 1;
@@ -1064,10 +1112,13 @@ static void update_metrics(HWND hwnd) {
 }
 
 static void resize_grid(HWND hwnd) {
-    RECT rc;
-    GetClientRect(hwnd, &rc);
-    int cols = (rc.right - rc.left - 16) / g_char_w;
-    int rows = (rc.bottom - rc.top - 16) / g_char_h;
+    RECT term;
+    int cols;
+    int rows;
+
+    get_terminal_rect(hwnd, &term);
+    cols = (term.right - term.left) / g_char_w;
+    rows = (term.bottom - term.top) / g_char_h;
     if (cols < 20) cols = 20;
     if (rows < 8) rows = 8;
     if (cols > MAX_COLS) cols = MAX_COLS;
@@ -1086,17 +1137,42 @@ static void resize_grid(HWND hwnd) {
     }
 }
 
-static void paint_terminal(HWND hwnd, HDC dc) {
+static void paint_chrome(HWND hwnd, HDC dc, const RECT* term) {
     RECT rc;
-    HBRUSH bg;
-    HFONT old_font;
+    RECT side;
+    RECT line;
 
     GetClientRect(hwnd, &rc);
-    bg = CreateSolidBrush(RGB(12, 16, 20));
-    FillRect(dc, &rc, bg);
-    DeleteObject(bg);
+    SetRect(&side, rc.left, rc.top, HOST_PANEL_W, rc.bottom);
+    fill_solid_rect(dc, &rc, RGB(10, 13, 17));
+    fill_solid_rect(dc, &side, RGB(16, 19, 24));
+    fill_solid_rect(dc, term, DEFAULT_BG);
 
+    SetRect(&line, HOST_PANEL_W, rc.top, HOST_PANEL_W + 1, rc.bottom);
+    fill_solid_rect(dc, &line, RGB(43, 50, 58));
+    SetRect(&line, HOST_PANEL_W, TAB_BAR_H, rc.right, TAB_BAR_H + 1);
+    fill_solid_rect(dc, &line, RGB(43, 50, 58));
+
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(155, 166, 178));
+    TextOutW(dc, 10, 5, L"Hosts", 5);
+
+    for (int i = 0; i < HOST_COUNT; i++) {
+        SetTextColor(dc, i == 0 ? RGB(232, 238, 245) : RGB(118, 128, 138));
+        TextOutW(dc, 14, 31 + i * HOST_ROW_H, g_hosts[i], lstrlenW(g_hosts[i]));
+    }
+
+    SetTextColor(dc, RGB(232, 238, 245));
+    TextOutW(dc, HOST_PANEL_W + 12, 5, L"Local cmd", 9);
+}
+
+static void paint_terminal(HWND hwnd, HDC dc) {
+    HFONT old_font;
+    RECT term;
+
+    get_terminal_rect(hwnd, &term);
     old_font = (HFONT)SelectObject(dc, g_font);
+    paint_chrome(hwnd, dc, &term);
     SetBkMode(dc, OPAQUE);
 
     EnterCriticalSection(&g_lock);
@@ -1112,16 +1188,16 @@ static void paint_terminal(HWND hwnd, HDC dc) {
             }
             SetTextColor(dc, fg);
             SetBkColor(dc, bgc);
-            TextOutW(dc, 8 + x * g_char_w, 8 + y * g_char_h, &ch, 1);
+            TextOutW(dc, term.left + x * g_char_w, term.top + y * g_char_h, &ch, 1);
         }
     }
 
     if (g_scroll_offset == 0 && g_cursor_visible) {
         RECT cursor = {
-            8 + g_cx * g_char_w,
-            8 + g_cy * g_char_h,
-            8 + (g_cx + 1) * g_char_w,
-            8 + (g_cy + 1) * g_char_h
+            term.left + g_cx * g_char_w,
+            term.top + g_cy * g_char_h,
+            term.left + (g_cx + 1) * g_char_w,
+            term.top + (g_cy + 1) * g_char_h
         };
         InvertRect(dc, &cursor);
     }
@@ -1303,6 +1379,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_LBUTTONDOWN:
+        if (!point_in_terminal(hwnd, lp)) {
+            handle_chrome_click(hwnd, lp);
+            return 0;
+        }
         mouse_to_cell(lp, &g_sel_anchor_x, &g_sel_anchor_y);
         g_sel_focus_x = g_sel_anchor_x;
         g_sel_focus_y = g_sel_anchor_y;
@@ -1356,13 +1436,19 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_word_selecting = 0;
             ReleaseCapture();
         }
+        if (!point_in_terminal(hwnd, lp)) {
+            handle_chrome_click(hwnd, lp);
+            return 0;
+        }
         mouse_to_cell(lp, &x, &y);
         start_word_selection_at(x, y);
         return 0;
     }
 
     case WM_RBUTTONDOWN:
-        paste_clipboard_text();
+        if (point_in_terminal(hwnd, lp)) {
+            paste_clipboard_text();
+        }
         return 0;
 
     case WM_BACKEND_DATA:
