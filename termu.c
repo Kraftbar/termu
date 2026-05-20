@@ -1097,6 +1097,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
 
+    case WM_RBUTTONDOWN:
+        paste_clipboard_text();
+        return 0;
+
     case WM_BACKEND_DATA:
         feed_output((const char*)lp, (DWORD)wp);
         free((void*)lp);
