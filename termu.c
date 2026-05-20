@@ -16,6 +16,7 @@
 #define APP_NAME L"Termu v0.2"
 #define WM_BACKEND_DATA (WM_APP + 1)
 #define WM_BACKEND_EXIT (WM_APP + 2)
+#define TIMER_REPAINT 1
 #define MAX_ROWS 80
 #define MAX_COLS 160
 #define MAX_HISTORY 4000
@@ -48,6 +49,7 @@ static int g_cx = 0;
 static int g_cy = 0;
 static int g_saved_cx = 0;
 static int g_saved_cy = 0;
+static int g_cursor_visible = 1;
 static COLORREF g_cur_fg = DEFAULT_FG;
 static COLORREF g_cur_bg = DEFAULT_BG;
 static int g_cur_fg_index = -1;
@@ -68,6 +70,7 @@ static EscapeState g_escape_state = ESC_NORMAL;
 static char g_csi_buf[64];
 static int g_csi_len = 0;
 static HANDLE g_output_log = NULL;
+static int g_repaint_pending = 0;
 static int g_selecting = 0;
 static int g_selection_active = 0;
 static int g_sel_anchor_x = 0;
@@ -101,6 +104,14 @@ static void log_backend_output(const char* data, DWORD len) {
     DWORD written = 0;
     if (g_output_log && data && len > 0) {
         WriteFile(g_output_log, data, len, &written, NULL);
+    }
+}
+
+static void schedule_terminal_repaint(void) {
+    if (!g_hwnd) return;
+    if (!g_repaint_pending) {
+        g_repaint_pending = 1;
+        SetTimer(g_hwnd, TIMER_REPAINT, 12, NULL);
     }
 }
 
@@ -186,7 +197,10 @@ static void return_to_live_view(void) {
     }
 }
 
+static void reset_text_attrs(void);
+
 static void clear_screen(void) {
+    reset_text_attrs();
     for (int y = 0; y < MAX_ROWS; y++) {
         for (int x = 0; x < MAX_COLS; x++) {
             clear_cell(&g_screen[y][x]);
@@ -283,7 +297,7 @@ static int parse_num(const char* s, int* i, int fallback) {
 
 static COLORREF ansi_color(int index, int bright) {
     static const COLORREF normal[8] = {
-        RGB(0, 0, 0),
+        RGB(118, 118, 118),
         RGB(197, 15, 31),
         RGB(19, 161, 14),
         RGB(193, 156, 0),
@@ -293,7 +307,7 @@ static COLORREF ansi_color(int index, int bright) {
         RGB(204, 204, 204)
     };
     static const COLORREF high[8] = {
-        RGB(118, 118, 118),
+        RGB(150, 150, 150),
         RGB(231, 72, 86),
         RGB(22, 198, 12),
         RGB(249, 241, 165),
@@ -406,7 +420,8 @@ static void handle_sgr(const char* seq, int len) {
 }
 
 static void handle_csi(const char* seq, int len) {
-    int i = 0;
+    int private_seq = len > 0 && seq[0] == '?';
+    int i = private_seq ? 1 : 0;
     int a = parse_num(seq, &i, 1);
     int b = 1;
     char cmd = len > 0 ? seq[len - 1] : 0;
@@ -419,6 +434,12 @@ static void handle_csi(const char* seq, int len) {
     if (i < len && seq[i] == ';') {
         i++;
         b = parse_num(seq, &i, 1);
+    }
+
+    if (private_seq) {
+        if (a == 25 && cmd == 'h') g_cursor_visible = 1;
+        if (a == 25 && cmd == 'l') g_cursor_visible = 0;
+        return;
     }
 
     switch (cmd) {
@@ -605,7 +626,7 @@ static void feed_output(const char* bytes, DWORD count) {
         }
     }
     LeaveCriticalSection(&g_lock);
-    InvalidateRect(g_hwnd, NULL, FALSE);
+    schedule_terminal_repaint();
 }
 
 static void mouse_to_cell(LPARAM lp, int* cell_x, int* cell_y) {
@@ -863,7 +884,7 @@ static void paint_terminal(HWND hwnd, HDC dc) {
         }
     }
 
-    if (g_scroll_offset == 0) {
+    if (g_scroll_offset == 0 && g_cursor_visible) {
         RECT cursor = {
             8 + g_cx * g_char_w,
             8 + g_cy * g_char_h,
@@ -875,6 +896,40 @@ static void paint_terminal(HWND hwnd, HDC dc) {
     LeaveCriticalSection(&g_lock);
 
     SelectObject(dc, old_font);
+}
+
+static void paint_terminal_buffered(HWND hwnd, HDC target_dc) {
+    RECT rc;
+    int width;
+    int height;
+    HDC mem_dc;
+    HBITMAP bitmap;
+    HBITMAP old_bitmap;
+
+    GetClientRect(hwnd, &rc);
+    width = rc.right - rc.left;
+    height = rc.bottom - rc.top;
+    if (width <= 0 || height <= 0) return;
+
+    mem_dc = CreateCompatibleDC(target_dc);
+    if (!mem_dc) {
+        paint_terminal(hwnd, target_dc);
+        return;
+    }
+
+    bitmap = CreateCompatibleBitmap(target_dc, width, height);
+    if (!bitmap) {
+        DeleteDC(mem_dc);
+        paint_terminal(hwnd, target_dc);
+        return;
+    }
+
+    old_bitmap = (HBITMAP)SelectObject(mem_dc, bitmap);
+    paint_terminal(hwnd, mem_dc);
+    BitBlt(target_dc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
+    SelectObject(mem_dc, old_bitmap);
+    DeleteObject(bitmap);
+    DeleteDC(mem_dc);
 }
 
 static int send_ctrl_key(WPARAM vk) {
@@ -902,6 +957,14 @@ static void send_virtual_key(WPARAM vk) {
     }
 }
 
+static int send_ctrl_navigation_key(WPARAM vk) {
+    switch (vk) {
+    case VK_RIGHT: backend_write("\x1b[1;5C", 6); return 1;
+    case VK_LEFT: backend_write("\x1b[1;5D", 6); return 1;
+    default: return 0;
+    }
+}
+
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
@@ -913,6 +976,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_font = (HFONT)GetStockObject(ANSI_FIXED_FONT);
         }
         update_metrics(hwnd);
+        resize_grid(hwnd);
         clear_screen();
         open_output_log();
         if (!term_backend_conpty_init(&g_backend)) {
@@ -965,6 +1029,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             set_scroll_offset(0);
             return 0;
         }
+        if ((GetKeyState(VK_CONTROL) & 0x8000) && send_ctrl_navigation_key(wp)) {
+            return 0;
+        }
         if (wp == VK_PRIOR) {
             scroll_view(g_rows - 1);
             return 0;
@@ -985,6 +1052,15 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             scroll_view(-3);
         }
         return 0;
+
+    case WM_TIMER:
+        if (wp == TIMER_REPAINT) {
+            KillTimer(hwnd, TIMER_REPAINT);
+            g_repaint_pending = 0;
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        break;
 
     case WM_PASTE:
         paste_clipboard_text();
@@ -1030,10 +1106,13 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         PostMessageW(hwnd, WM_CLOSE, 0, 0);
         return 0;
 
+    case WM_ERASEBKGND:
+        return 1;
+
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
-        paint_terminal(hwnd, dc);
+        paint_terminal_buffered(hwnd, dc);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -1047,6 +1126,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_DESTROY:
+        KillTimer(hwnd, TIMER_REPAINT);
         if (g_backend.stop) g_backend.stop(&g_backend);
         close_output_log();
         if (g_font) DeleteObject(g_font);
@@ -1067,7 +1147,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
     wc.hCursor = LoadCursor(NULL, IDC_IBEAM);
     wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
     wc.lpszClassName = L"TermuWindow";
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hbrBackground = NULL;
     if (!RegisterClassW(&wc)) return 1;
 
     {
