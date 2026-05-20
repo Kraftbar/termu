@@ -20,6 +20,7 @@
 #define MAX_ROWS 80
 #define MAX_COLS 160
 #define MAX_HISTORY 4000
+#define MAX_OSC 512
 #define START_ROWS 32
 #define START_COLS 100
 #define DEFAULT_FG RGB(230, 230, 230)
@@ -69,6 +70,8 @@ static int g_utf8_pending_len = 0;
 static EscapeState g_escape_state = ESC_NORMAL;
 static char g_csi_buf[64];
 static int g_csi_len = 0;
+static WCHAR g_osc_buf[MAX_OSC];
+static int g_osc_len = 0;
 static HANDLE g_output_log = NULL;
 static int g_repaint_pending = 0;
 static int g_selecting = 0;
@@ -493,6 +496,33 @@ static void handle_csi(const char* seq, int len) {
     }
 }
 
+static void append_osc_char(WCHAR ch) {
+    if (g_osc_len < MAX_OSC - 1) {
+        g_osc_buf[g_osc_len++] = ch;
+    }
+}
+
+static void handle_osc(void) {
+    int i = 0;
+    int code = 0;
+    WCHAR title[MAX_OSC + 16];
+
+    g_osc_buf[g_osc_len] = 0;
+    while (i < g_osc_len && g_osc_buf[i] >= L'0' && g_osc_buf[i] <= L'9') {
+        code = code * 10 + (g_osc_buf[i] - L'0');
+        i++;
+    }
+    if (i >= g_osc_len || g_osc_buf[i] != L';') return;
+    i++;
+
+    if ((code == 0 || code == 2) && g_osc_buf[i]) {
+        lstrcpynW(title, APP_NAME L" - ", MAX_OSC);
+        lstrcpynW(title + lstrlenW(title), g_osc_buf + i,
+                  MAX_OSC - lstrlenW(title));
+        SetWindowTextW(g_hwnd, title);
+    }
+}
+
 static int utf8_sequence_len(unsigned char c) {
     if (c < 0x80) return 1;
     if (c >= 0xc2 && c <= 0xdf) return 2;
@@ -584,6 +614,7 @@ static void feed_output(const char* bytes, DWORD count) {
                 g_csi_len = 0;
             } else if (ch == L']') {
                 g_escape_state = ESC_OSC;
+                g_osc_len = 0;
             } else if (ch == L'c') {
                 reset_text_attrs();
                 clear_screen();
@@ -608,18 +639,24 @@ static void feed_output(const char* bytes, DWORD count) {
 
         case ESC_OSC:
             if (ch == 0x07) {
+                handle_osc();
                 g_escape_state = ESC_NORMAL;
             } else if (ch == 0x1b) {
                 g_escape_state = ESC_OSC_ESC;
+            } else {
+                append_osc_char(ch);
             }
             break;
 
         case ESC_OSC_ESC:
             if (ch == L'\\') {
+                handle_osc();
                 g_escape_state = ESC_NORMAL;
             } else if (ch == 0x1b) {
                 g_escape_state = ESC_OSC_ESC;
             } else {
+                append_osc_char(0x1b);
+                append_osc_char(ch);
                 g_escape_state = ESC_OSC;
             }
             break;
