@@ -23,7 +23,7 @@ the user what changed and what specific behavior to check.
 
 `termu.c` owns the UI. `backend_conpty.c` owns local `cmd.exe` ConPTY I/O.
 Add SSH later as another `TermBackend`; keep SFTP/SCP separate from terminal I/O.
-Defer font zoom and last-line flicker work for now.
+Defer font zoom and last-line flicker work for now; both are tricky rabbit holes.
 
 ## Roadmap
 
