@@ -215,6 +215,8 @@ static void conpty_stop(TermBackend* backend) {
     ConptyState* state = (ConptyState*)backend->state;
     if (!state) return;
     conpty_close_resources(state);
+    free(state);
+    backend->state = NULL;
 }
 
 int term_backend_conpty_init(TermBackend* backend) {

@@ -29,6 +29,8 @@
 #define TAB_BAR_H 26
 #define TERM_PAD 6
 #define HOST_ROW_H 22
+#define TAB_W 126
+#define MAX_SESSIONS 8
 
 typedef struct {
     WCHAR ch;
@@ -49,6 +51,45 @@ typedef enum {
     ESC_OSC_ESC
 } EscapeState;
 
+typedef struct {
+    TermBackend backend;
+    WCHAR name[64];
+    WCHAR title[MAX_OSC];
+    int host_index;
+    int exited;
+    int cx;
+    int cy;
+    int saved_cx;
+    int saved_cy;
+    int cursor_visible;
+    COLORREF cur_fg;
+    COLORREF cur_bg;
+    int cur_fg_index;
+    int cur_bg_index;
+    int cur_fg_bright;
+    int cur_bg_bright;
+    int bold;
+    int reverse;
+    Cell screen[MAX_ROWS][MAX_COLS];
+    Cell history[MAX_HISTORY][MAX_COLS];
+    int history_start;
+    int history_count;
+    int scroll_offset;
+    char utf8_pending[4];
+    int utf8_pending_len;
+    EscapeState escape_state;
+    char csi_buf[64];
+    int csi_len;
+    WCHAR osc_buf[MAX_OSC];
+    int osc_len;
+} TermSession;
+
+typedef struct {
+    TermSession* session;
+    DWORD len;
+    char data[1];
+} BackendData;
+
 static HWND g_hwnd;
 static HFONT g_font;
 static HICON g_app_icon;
@@ -56,33 +97,7 @@ static int g_char_w = 8;
 static int g_char_h = 16;
 static int g_rows = START_ROWS;
 static int g_cols = START_COLS;
-static int g_cx = 0;
-static int g_cy = 0;
-static int g_saved_cx = 0;
-static int g_saved_cy = 0;
-static int g_cursor_visible = 1;
-static COLORREF g_cur_fg = DEFAULT_FG;
-static COLORREF g_cur_bg = DEFAULT_BG;
-static int g_cur_fg_index = -1;
-static int g_cur_bg_index = -1;
-static int g_cur_fg_bright = 0;
-static int g_cur_bg_bright = 0;
-static int g_bold = 0;
-static int g_reverse = 0;
-static Cell g_screen[MAX_ROWS][MAX_COLS];
-static Cell g_history[MAX_HISTORY][MAX_COLS];
-static int g_history_start = 0;
-static int g_history_count = 0;
-static int g_scroll_offset = 0;
 static CRITICAL_SECTION g_lock;
-static TermBackend g_backend;
-static char g_utf8_pending[4];
-static int g_utf8_pending_len = 0;
-static EscapeState g_escape_state = ESC_NORMAL;
-static char g_csi_buf[64];
-static int g_csi_len = 0;
-static WCHAR g_osc_buf[MAX_OSC];
-static int g_osc_len = 0;
 static HANDLE g_output_log = NULL;
 static int g_repaint_pending = 0;
 static int g_selecting = 0;
@@ -102,6 +117,37 @@ static const HostEntry g_hosts[] = {
     { L"router", NULL }
 };
 #define HOST_COUNT ((int)(sizeof(g_hosts) / sizeof(g_hosts[0])))
+static TermSession* g_sessions[MAX_SESSIONS];
+static int g_session_count = 0;
+static int g_active_session = -1;
+static TermSession* g_session = NULL;
+
+#define g_backend (g_session->backend)
+#define g_cx (g_session->cx)
+#define g_cy (g_session->cy)
+#define g_saved_cx (g_session->saved_cx)
+#define g_saved_cy (g_session->saved_cy)
+#define g_cursor_visible (g_session->cursor_visible)
+#define g_cur_fg (g_session->cur_fg)
+#define g_cur_bg (g_session->cur_bg)
+#define g_cur_fg_index (g_session->cur_fg_index)
+#define g_cur_bg_index (g_session->cur_bg_index)
+#define g_cur_fg_bright (g_session->cur_fg_bright)
+#define g_cur_bg_bright (g_session->cur_bg_bright)
+#define g_bold (g_session->bold)
+#define g_reverse (g_session->reverse)
+#define g_screen (g_session->screen)
+#define g_history (g_session->history)
+#define g_history_start (g_session->history_start)
+#define g_history_count (g_session->history_count)
+#define g_scroll_offset (g_session->scroll_offset)
+#define g_utf8_pending (g_session->utf8_pending)
+#define g_utf8_pending_len (g_session->utf8_pending_len)
+#define g_escape_state (g_session->escape_state)
+#define g_csi_buf (g_session->csi_buf)
+#define g_csi_len (g_session->csi_len)
+#define g_osc_buf (g_session->osc_buf)
+#define g_osc_len (g_session->osc_len)
 
 static void die_box(const WCHAR* text) {
     MessageBoxW(NULL, text, APP_NAME, MB_OK | MB_ICONERROR);
@@ -109,6 +155,25 @@ static void die_box(const WCHAR* text) {
 
 static int backend_write(const char* s, DWORD len);
 static int copy_selection_to_clipboard(void);
+static int start_host_session(int host_index);
+static void switch_session(int index);
+static void close_session(int index);
+
+static TermSession* active_session(void) {
+    if (g_active_session < 0 || g_active_session >= g_session_count) return NULL;
+    return g_sessions[g_active_session];
+}
+
+static void set_active_session(int index) {
+    if (index < 0) {
+        g_active_session = -1;
+        g_session = NULL;
+        return;
+    }
+    if (index >= g_session_count || !g_sessions[index]) return;
+    g_active_session = index;
+    g_session = g_sessions[index];
+}
 
 static void fill_icon_rect(DWORD* pixels, int x, int y, int w, int h, DWORD color) {
     for (int py = y; py < y + h; py++) {
@@ -633,10 +698,21 @@ static void append_osc_char(WCHAR ch) {
     }
 }
 
+static void update_window_title(void) {
+    WCHAR title[MAX_OSC + 16];
+    TermSession* session = active_session();
+    const WCHAR* label;
+    if (!g_hwnd || !session) return;
+    label = session->title[0] ? session->title : session->name;
+    lstrcpynW(title, APP_NAME L" - ", MAX_OSC);
+    lstrcpynW(title + lstrlenW(title), label,
+              MAX_OSC - lstrlenW(title));
+    SetWindowTextW(g_hwnd, title);
+}
+
 static void handle_osc(void) {
     int i = 0;
     int code = 0;
-    WCHAR title[MAX_OSC + 16];
 
     g_osc_buf[g_osc_len] = 0;
     while (i < g_osc_len && g_osc_buf[i] >= L'0' && g_osc_buf[i] <= L'9') {
@@ -647,10 +723,9 @@ static void handle_osc(void) {
     i++;
 
     if ((code == 0 || code == 2) && g_osc_buf[i]) {
-        lstrcpynW(title, APP_NAME L" - ", MAX_OSC);
-        lstrcpynW(title + lstrlenW(title), g_osc_buf + i,
-                  MAX_OSC - lstrlenW(title));
-        SetWindowTextW(g_hwnd, title);
+        lstrcpynW(g_session->title, g_osc_buf + i,
+                  (int)(sizeof(g_session->title) / sizeof(g_session->title[0])));
+        if (g_session == active_session()) update_window_title();
     }
 }
 
@@ -721,10 +796,17 @@ static int decode_output_bytes(const char* bytes, DWORD count, WCHAR* wbuf, int 
     return wlen;
 }
 
-static void feed_output(const char* bytes, DWORD count) {
+static void feed_output(TermSession* session, const char* bytes, DWORD count) {
+    TermSession* old_session = g_session;
     WCHAR wbuf[8192];
-    int wlen = decode_output_bytes(bytes, count, wbuf, 8192);
-    if (wlen <= 0) return;
+    int wlen;
+    if (!session) return;
+    g_session = session;
+    wlen = decode_output_bytes(bytes, count, wbuf, 8192);
+    if (wlen <= 0) {
+        g_session = old_session;
+        return;
+    }
 
     EnterCriticalSection(&g_lock);
     for (int i = 0; i < wlen; i++) {
@@ -794,6 +876,7 @@ static void feed_output(const char* bytes, DWORD count) {
         }
     }
     LeaveCriticalSection(&g_lock);
+    g_session = old_session;
     schedule_terminal_repaint();
 }
 
@@ -823,15 +906,25 @@ static int host_at_point(int px, int py) {
     return row >= 0 && row < HOST_COUNT ? row : -1;
 }
 
+static int tab_at_point(int px, int py) {
+    int tab;
+    if (py < 0 || py >= TAB_BAR_H || px < HOST_PANEL_W + 8) return -1;
+    tab = (px - (HOST_PANEL_W + 8)) / TAB_W;
+    return tab >= 0 && tab < g_session_count ? tab : -1;
+}
+
 static void handle_chrome_click(HWND hwnd, LPARAM lp) {
     int px = (int)(short)LOWORD(lp);
     int py = (int)(short)HIWORD(lp);
     int host = host_at_point(px, py);
+    int tab = tab_at_point(px, py);
 
     g_selection_active = 0;
     SetFocus(hwnd);
-    if (host >= 0 && g_hosts[host].command) {
-        backend_write(g_hosts[host].command, (DWORD)strlen(g_hosts[host].command));
+    if (tab >= 0) {
+        switch_session(tab);
+    } else if (host == 0 || (host > 0 && g_hosts[host].command)) {
+        start_host_session(host);
     }
     InvalidateRect(hwnd, NULL, FALSE);
 }
@@ -1095,27 +1188,129 @@ static int paste_clipboard_text(void) {
 }
 
 static void post_backend_output(const char* data, DWORD len, void* user) {
-    HWND hwnd = (HWND)user;
-    char* copy;
+    TermSession* session = (TermSession*)user;
+    BackendData* msg;
 
     if (!data || len == 0) {
-        PostMessageW(hwnd, WM_BACKEND_EXIT, 0, 0);
+        PostMessageW(g_hwnd, WM_BACKEND_EXIT, 0, (LPARAM)session);
         return;
     }
 
     log_backend_output(data, len);
-    copy = (char*)malloc(len);
-    if (!copy) return;
-    memcpy(copy, data, len);
-    if (!PostMessageW(hwnd, WM_BACKEND_DATA, (WPARAM)len, (LPARAM)copy)) {
-        free(copy);
+    msg = (BackendData*)malloc(sizeof(*msg) + len);
+    if (!msg) return;
+    msg->session = session;
+    msg->len = len;
+    memcpy(msg->data, data, len);
+    if (!PostMessageW(g_hwnd, WM_BACKEND_DATA, 0, (LPARAM)msg)) {
+        free(msg);
     }
 }
 
 static int backend_write(const char* s, DWORD len) {
+    if (!g_session) return 0;
     if (!g_backend.write) return 0;
     return_to_live_view();
     return g_backend.write(&g_backend, s, len);
+}
+
+static int session_for_host(int host_index) {
+    for (int i = 0; i < g_session_count; i++) {
+        if (g_sessions[i] && g_sessions[i]->host_index == host_index) return i;
+    }
+    return -1;
+}
+
+static int session_is_live(TermSession* session) {
+    for (int i = 0; i < g_session_count; i++) {
+        if (g_sessions[i] == session) return 1;
+    }
+    return 0;
+}
+
+static void switch_session(int index) {
+    if (index < 0 || index >= g_session_count || !g_sessions[index]) return;
+    set_active_session(index);
+    g_selection_active = 0;
+    update_window_title();
+    InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
+static void close_session(int index) {
+    TermSession* session;
+    if (index < 0 || index >= g_session_count || !g_sessions[index]) return;
+
+    session = g_sessions[index];
+    g_session = session;
+    if (g_backend.stop) g_backend.stop(&g_backend);
+    free(session);
+
+    for (int i = index; i < g_session_count - 1; i++) {
+        g_sessions[i] = g_sessions[i + 1];
+    }
+    g_session_count--;
+    g_sessions[g_session_count] = NULL;
+
+    if (g_session_count == 0) {
+        set_active_session(-1);
+        PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+        return;
+    }
+    if (index >= g_session_count) index = g_session_count - 1;
+    switch_session(index);
+}
+
+static int start_host_session(int host_index) {
+    TermSession* session;
+    int existing = session_for_host(host_index);
+
+    if (existing >= 0) {
+        switch_session(existing);
+        return 1;
+    }
+    if (host_index < 0 || host_index >= HOST_COUNT) return 0;
+    if (g_session_count >= MAX_SESSIONS) {
+        die_box(L"Maximum session count reached.");
+        return 0;
+    }
+
+    session = (TermSession*)calloc(1, sizeof(*session));
+    if (!session) return 0;
+    session->host_index = host_index;
+    session->cursor_visible = 1;
+    lstrcpynW(session->name, g_hosts[host_index].name,
+              (int)(sizeof(session->name) / sizeof(session->name[0])));
+
+    g_sessions[g_session_count] = session;
+    g_session_count++;
+    set_active_session(g_session_count - 1);
+    clear_screen();
+
+    if (!term_backend_conpty_init(&session->backend)) {
+        die_box(L"Could not initialize the local ConPTY backend.");
+        g_session_count--;
+        g_sessions[g_session_count] = NULL;
+        free(session);
+        set_active_session(g_session_count - 1);
+        return 0;
+    }
+    if (!session->backend.start(&session->backend, g_cols, g_rows,
+                                post_backend_output, session)) {
+        die_box(L"Could not start cmd.exe through ConPTY. This prototype needs Windows 10 1809 or newer.");
+        if (session->backend.stop) session->backend.stop(&session->backend);
+        g_session_count--;
+        g_sessions[g_session_count] = NULL;
+        free(session);
+        set_active_session(g_session_count - 1);
+        return 0;
+    }
+    if (g_hosts[host_index].command) {
+        session->backend.write(&session->backend, g_hosts[host_index].command,
+                               (DWORD)strlen(g_hosts[host_index].command));
+    }
+    update_window_title();
+    InvalidateRect(g_hwnd, NULL, FALSE);
+    return 1;
 }
 
 static void update_metrics(HWND hwnd) {
@@ -1146,13 +1341,21 @@ static void resize_grid(HWND hwnd) {
     EnterCriticalSection(&g_lock);
     g_cols = cols;
     g_rows = rows;
-    if (g_cx >= g_cols) g_cx = g_cols - 1;
-    if (g_cy >= g_rows) g_cy = g_rows - 1;
-    LeaveCriticalSection(&g_lock);
-
-    if (g_backend.resize) {
-        g_backend.resize(&g_backend, g_cols, g_rows);
+    for (int i = 0; i < g_session_count; i++) {
+        TermSession* old_session = g_session;
+        g_session = g_sessions[i];
+        if (!g_session) {
+            g_session = old_session;
+            continue;
+        }
+        if (g_cx >= g_cols) g_cx = g_cols - 1;
+        if (g_cy >= g_rows) g_cy = g_rows - 1;
+        if (g_backend.resize) {
+            g_backend.resize(&g_backend, g_cols, g_rows);
+        }
+        g_session = old_session;
     }
+    LeaveCriticalSection(&g_lock);
 }
 
 static void paint_chrome(HWND hwnd, HDC dc, const RECT* term) {
@@ -1176,7 +1379,7 @@ static void paint_chrome(HWND hwnd, HDC dc, const RECT* term) {
     TextOutW(dc, 10, 5, L"Hosts", 5);
 
     for (int i = 0; i < HOST_COUNT; i++) {
-        if (i == 0) {
+        if (session_for_host(i) >= 0) {
             SetTextColor(dc, RGB(232, 238, 245));
         } else if (g_hosts[i].command) {
             SetTextColor(dc, RGB(200, 210, 220));
@@ -1187,8 +1390,12 @@ static void paint_chrome(HWND hwnd, HDC dc, const RECT* term) {
                  g_hosts[i].name, lstrlenW(g_hosts[i].name));
     }
 
-    SetTextColor(dc, RGB(232, 238, 245));
-    TextOutW(dc, HOST_PANEL_W + 12, 5, L"Local cmd", 9);
+    for (int i = 0; i < g_session_count; i++) {
+        if (!g_sessions[i]) continue;
+        SetTextColor(dc, i == g_active_session ? RGB(232, 238, 245) : RGB(145, 155, 165));
+        TextOutW(dc, HOST_PANEL_W + 12 + i * TAB_W, 5,
+                 g_sessions[i]->name, lstrlenW(g_sessions[i]->name));
+    }
 }
 
 static void paint_terminal(HWND hwnd, HDC dc) {
@@ -1198,6 +1405,10 @@ static void paint_terminal(HWND hwnd, HDC dc) {
     get_terminal_rect(hwnd, &term);
     old_font = (HFONT)SelectObject(dc, g_font);
     paint_chrome(hwnd, dc, &term);
+    if (!g_session) {
+        SelectObject(dc, old_font);
+        return;
+    }
     SetBkMode(dc, OPAQUE);
 
     EnterCriticalSection(&g_lock);
@@ -1314,14 +1525,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         update_metrics(hwnd);
         resize_grid(hwnd);
-        clear_screen();
         open_output_log();
-        if (!term_backend_conpty_init(&g_backend)) {
-            die_box(L"Could not initialize the local ConPTY backend.");
-            return -1;
-        }
-        if (!g_backend.start(&g_backend, g_cols, g_rows, post_backend_output, hwnd)) {
-            die_box(L"Could not start cmd.exe through ConPTY. This prototype needs Windows 10 1809 or newer.");
+        if (!start_host_session(0)) {
             return -1;
         }
         SetFocus(hwnd);
@@ -1354,7 +1559,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (wp == 'W') {
-                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                close_session(g_active_session);
                 return 0;
             }
         }
@@ -1477,12 +1682,20 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_BACKEND_DATA:
-        feed_output((const char*)lp, (DWORD)wp);
+        if (lp) {
+            BackendData* data = (BackendData*)lp;
+            if (session_is_live(data->session)) {
+                feed_output(data->session, data->data, data->len);
+            }
+        }
         free((void*)lp);
         return 0;
 
     case WM_BACKEND_EXIT:
-        PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        if (lp && session_is_live((TermSession*)lp)) {
+            ((TermSession*)lp)->exited = 1;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
         return 0;
 
     case WM_ERASEBKGND:
@@ -1506,7 +1719,16 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_REPAINT);
-        if (g_backend.stop) g_backend.stop(&g_backend);
+        for (int i = 0; i < g_session_count; i++) {
+            if (g_sessions[i]) {
+                g_session = g_sessions[i];
+                if (g_backend.stop) g_backend.stop(&g_backend);
+                free(g_sessions[i]);
+                g_sessions[i] = NULL;
+            }
+        }
+        g_session_count = 0;
+        set_active_session(-1);
         close_output_log();
         if (g_font) DeleteObject(g_font);
         if (g_app_icon) {
