@@ -36,6 +36,11 @@ typedef struct {
     COLORREF bg;
 } Cell;
 
+typedef struct {
+    const WCHAR* name;
+    const char* command;
+} HostEntry;
+
 typedef enum {
     ESC_NORMAL,
     ESC_SEEN,
@@ -90,11 +95,11 @@ static int g_sel_focus_y = 0;
 static int g_word_anchor_start_x = 0;
 static int g_word_anchor_end_x = 0;
 static int g_word_anchor_y = 0;
-static const WCHAR* g_hosts[] = {
-    L"Local cmd",
-    L"nybo-linux",
-    L"web01",
-    L"router"
+static const HostEntry g_hosts[] = {
+    { L"Local cmd", NULL },
+    { L"nybo-linux", "ssh nybo@nybo-loq-15irx10.lan\r" },
+    { L"web01", NULL },
+    { L"router", NULL }
 };
 #define HOST_COUNT ((int)(sizeof(g_hosts) / sizeof(g_hosts[0])))
 
@@ -811,10 +816,23 @@ static int point_in_terminal(HWND hwnd, LPARAM lp) {
     return px >= term.left && px < term.right && py >= term.top && py < term.bottom;
 }
 
+static int host_at_point(int px, int py) {
+    int row;
+    if (px < 0 || px >= HOST_PANEL_W || py < 28) return -1;
+    row = (py - 28) / HOST_ROW_H;
+    return row >= 0 && row < HOST_COUNT ? row : -1;
+}
+
 static void handle_chrome_click(HWND hwnd, LPARAM lp) {
-    (void)lp;
+    int px = (int)(short)LOWORD(lp);
+    int py = (int)(short)HIWORD(lp);
+    int host = host_at_point(px, py);
+
     g_selection_active = 0;
     SetFocus(hwnd);
+    if (host >= 0 && g_hosts[host].command) {
+        backend_write(g_hosts[host].command, (DWORD)strlen(g_hosts[host].command));
+    }
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
@@ -1158,8 +1176,15 @@ static void paint_chrome(HWND hwnd, HDC dc, const RECT* term) {
     TextOutW(dc, 10, 5, L"Hosts", 5);
 
     for (int i = 0; i < HOST_COUNT; i++) {
-        SetTextColor(dc, i == 0 ? RGB(232, 238, 245) : RGB(118, 128, 138));
-        TextOutW(dc, 14, 31 + i * HOST_ROW_H, g_hosts[i], lstrlenW(g_hosts[i]));
+        if (i == 0) {
+            SetTextColor(dc, RGB(232, 238, 245));
+        } else if (g_hosts[i].command) {
+            SetTextColor(dc, RGB(200, 210, 220));
+        } else {
+            SetTextColor(dc, RGB(118, 128, 138));
+        }
+        TextOutW(dc, 14, 31 + i * HOST_ROW_H,
+                 g_hosts[i].name, lstrlenW(g_hosts[i].name));
     }
 
     SetTextColor(dc, RGB(232, 238, 245));
