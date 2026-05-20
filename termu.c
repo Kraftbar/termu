@@ -75,11 +75,15 @@ static int g_osc_len = 0;
 static HANDLE g_output_log = NULL;
 static int g_repaint_pending = 0;
 static int g_selecting = 0;
+static int g_word_selecting = 0;
 static int g_selection_active = 0;
 static int g_sel_anchor_x = 0;
 static int g_sel_anchor_y = 0;
 static int g_sel_focus_x = 0;
 static int g_sel_focus_y = 0;
+static int g_word_anchor_start_x = 0;
+static int g_word_anchor_end_x = 0;
+static int g_word_anchor_y = 0;
 
 static void die_box(const WCHAR* text) {
     MessageBoxW(NULL, text, APP_NAME, MB_OK | MB_ICONERROR);
@@ -718,10 +722,8 @@ static int word_char(WCHAR ch) {
     return ch > L' ' && ch != 0;
 }
 
-static int select_word_at(int x, int y) {
+static int word_bounds_at(int x, int y, int* start, int* end) {
     const Cell* line;
-    int start;
-    int end;
 
     if (x < 0 || x >= g_cols || y < 0 || y >= g_rows) return 0;
 
@@ -732,11 +734,35 @@ static int select_word_at(int x, int y) {
         return 0;
     }
 
-    start = x;
-    end = x;
-    while (start > 0 && word_char(line[start - 1].ch)) start--;
-    while (end + 1 < g_cols && word_char(line[end + 1].ch)) end++;
+    *start = x;
+    *end = x;
+    while (*start > 0 && word_char(line[*start - 1].ch)) (*start)--;
+    while (*end + 1 < g_cols && word_char(line[*end + 1].ch)) (*end)++;
     LeaveCriticalSection(&g_lock);
+    return 1;
+}
+
+static void set_word_selection_range(int focus_start, int focus_end, int focus_y) {
+    if (focus_y < g_word_anchor_y ||
+        (focus_y == g_word_anchor_y && focus_end < g_word_anchor_start_x)) {
+        g_sel_anchor_x = g_word_anchor_end_x;
+        g_sel_anchor_y = g_word_anchor_y;
+        g_sel_focus_x = focus_start;
+        g_sel_focus_y = focus_y;
+    } else {
+        g_sel_anchor_x = g_word_anchor_start_x;
+        g_sel_anchor_y = g_word_anchor_y;
+        g_sel_focus_x = focus_end;
+        g_sel_focus_y = focus_y;
+    }
+    g_selection_active = 1;
+}
+
+static int select_word_at(int x, int y) {
+    int start;
+    int end;
+
+    if (!word_bounds_at(x, y, &start, &end)) return 0;
 
     g_sel_anchor_x = start;
     g_sel_anchor_y = y;
@@ -744,9 +770,38 @@ static int select_word_at(int x, int y) {
     g_sel_focus_y = y;
     g_selection_active = 1;
     g_selecting = 0;
+    g_word_selecting = 0;
     copy_selection_to_clipboard();
     InvalidateRect(g_hwnd, NULL, FALSE);
     return 1;
+}
+
+static int start_word_selection_at(int x, int y) {
+    int start;
+    int end;
+
+    if (!word_bounds_at(x, y, &start, &end)) return 0;
+    g_word_anchor_start_x = start;
+    g_word_anchor_end_x = end;
+    g_word_anchor_y = y;
+    set_word_selection_range(start, end, y);
+    g_selecting = 1;
+    g_word_selecting = 1;
+    SetCapture(g_hwnd);
+    InvalidateRect(g_hwnd, NULL, FALSE);
+    return 1;
+}
+
+static void update_word_selection_at(int x, int y) {
+    int start;
+    int end;
+
+    if (!word_bounds_at(x, y, &start, &end)) {
+        start = x;
+        end = x;
+    }
+    set_word_selection_range(start, end, y);
+    InvalidateRect(g_hwnd, NULL, FALSE);
 }
 
 static int copy_selection_to_clipboard(void) {
@@ -1151,15 +1206,30 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_MOUSEMOVE:
         if (g_selecting) {
-            mouse_to_cell(lp, &g_sel_focus_x, &g_sel_focus_y);
+            if (g_word_selecting) {
+                int x;
+                int y;
+                mouse_to_cell(lp, &x, &y);
+                update_word_selection_at(x, y);
+            } else {
+                mouse_to_cell(lp, &g_sel_focus_x, &g_sel_focus_y);
+            }
             InvalidateRect(hwnd, NULL, FALSE);
         }
         return 0;
 
     case WM_LBUTTONUP:
         if (g_selecting) {
-            mouse_to_cell(lp, &g_sel_focus_x, &g_sel_focus_y);
+            if (g_word_selecting) {
+                int x;
+                int y;
+                mouse_to_cell(lp, &x, &y);
+                update_word_selection_at(x, y);
+            } else {
+                mouse_to_cell(lp, &g_sel_focus_x, &g_sel_focus_y);
+            }
             g_selecting = 0;
+            g_word_selecting = 0;
             ReleaseCapture();
             if (selection_has_text()) {
                 copy_selection_to_clipboard();
@@ -1175,10 +1245,11 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int y;
         if (g_selecting) {
             g_selecting = 0;
+            g_word_selecting = 0;
             ReleaseCapture();
         }
         mouse_to_cell(lp, &x, &y);
-        select_word_at(x, y);
+        start_word_selection_at(x, y);
         return 0;
     }
 
