@@ -18,6 +18,7 @@
 #define WM_BACKEND_EXIT (WM_APP + 2)
 #define MAX_ROWS 80
 #define MAX_COLS 160
+#define MAX_HISTORY 4000
 #define START_ROWS 32
 #define START_COLS 100
 
@@ -46,6 +47,10 @@ static int g_cy = 0;
 static int g_saved_cx = 0;
 static int g_saved_cy = 0;
 static Cell g_screen[MAX_ROWS][MAX_COLS];
+static Cell g_history[MAX_HISTORY][MAX_COLS];
+static int g_history_start = 0;
+static int g_history_count = 0;
+static int g_scroll_offset = 0;
 static CRITICAL_SECTION g_lock;
 static TermBackend g_backend;
 static char g_utf8_pending[4];
@@ -96,6 +101,82 @@ static void clear_cell(Cell* c) {
     c->bg = RGB(12, 16, 20);
 }
 
+static void clear_line(Cell* line) {
+    for (int x = 0; x < MAX_COLS; x++) {
+        clear_cell(&line[x]);
+    }
+}
+
+static Cell* history_line_at(int index) {
+    return g_history[(g_history_start + index) % MAX_HISTORY];
+}
+
+static void clear_scrollback(void) {
+    g_history_start = 0;
+    g_history_count = 0;
+    g_scroll_offset = 0;
+}
+
+static void clamp_scroll_offset(void) {
+    if (g_scroll_offset < 0) g_scroll_offset = 0;
+    if (g_scroll_offset > g_history_count) g_scroll_offset = g_history_count;
+}
+
+static void push_history_line(const Cell* line) {
+    int dest;
+    if (g_history_count < MAX_HISTORY) {
+        dest = (g_history_start + g_history_count) % MAX_HISTORY;
+        g_history_count++;
+    } else {
+        dest = g_history_start;
+        g_history_start = (g_history_start + 1) % MAX_HISTORY;
+    }
+
+    memcpy(g_history[dest], line, sizeof(Cell) * MAX_COLS);
+    if (g_scroll_offset > 0) {
+        g_scroll_offset++;
+        clamp_scroll_offset();
+    }
+}
+
+static const Cell* view_line_at(int y) {
+    static Cell blank[MAX_COLS];
+    static int blank_ready = 0;
+    int start = g_history_count - g_scroll_offset;
+    int index = start + y;
+
+    if (!blank_ready) {
+        clear_line(blank);
+        blank_ready = 1;
+    }
+
+    if (index < 0) return blank;
+    if (index < g_history_count) return history_line_at(index);
+
+    index -= g_history_count;
+    if (index >= 0 && index < g_rows) return g_screen[index];
+    return blank;
+}
+
+static void set_scroll_offset(int offset) {
+    g_scroll_offset = offset;
+    clamp_scroll_offset();
+    g_selection_active = 0;
+    InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
+static void scroll_view(int delta) {
+    set_scroll_offset(g_scroll_offset + delta);
+}
+
+static void return_to_live_view(void) {
+    if (g_scroll_offset != 0) {
+        g_scroll_offset = 0;
+        g_selection_active = 0;
+        InvalidateRect(g_hwnd, NULL, FALSE);
+    }
+}
+
 static void clear_screen(void) {
     for (int y = 0; y < MAX_ROWS; y++) {
         for (int x = 0; x < MAX_COLS; x++) {
@@ -104,6 +185,7 @@ static void clear_screen(void) {
     }
     g_cx = 0;
     g_cy = 0;
+    g_scroll_offset = 0;
 }
 
 static void clear_line_from_cursor(void) {
@@ -113,12 +195,11 @@ static void clear_line_from_cursor(void) {
 }
 
 static void scroll_up(void) {
+    push_history_line(g_screen[0]);
     for (int y = 1; y < g_rows; y++) {
-        memcpy(g_screen[y - 1], g_screen[y], sizeof(Cell) * g_cols);
+        memcpy(g_screen[y - 1], g_screen[y], sizeof(Cell) * MAX_COLS);
     }
-    for (int x = 0; x < g_cols; x++) {
-        clear_cell(&g_screen[g_rows - 1][x]);
-    }
+    clear_line(g_screen[g_rows - 1]);
     if (g_cy > 0) g_cy--;
 }
 
@@ -203,6 +284,7 @@ static void handle_csi(const char* seq, int len) {
         if (g_cx >= g_cols) g_cx = g_cols - 1;
         break;
     case 'J':
+        if (a == 3) clear_scrollback();
         if (a == 2 || a == 3) clear_screen();
         break;
     case 'K':
@@ -418,13 +500,14 @@ static int copy_selection_to_clipboard(void) {
 
     EnterCriticalSection(&g_lock);
     for (int y = sy; y <= ey; y++) {
+        const Cell* line = view_line_at(y);
         int row_start = (y == sy) ? sx : 0;
         int row_end = (y == ey) ? ex : g_cols - 1;
-        while (row_end >= row_start && g_screen[y][row_end].ch == L' ') {
+        while (row_end >= row_start && line[row_end].ch == L' ') {
             row_end--;
         }
         for (int x = row_start; x <= row_end; x++) {
-            text[pos++] = g_screen[y][x].ch;
+            text[pos++] = line[x].ch;
         }
         if (y != ey) {
             text[pos++] = L'\r';
@@ -541,6 +624,7 @@ static void post_backend_output(const char* data, DWORD len, void* user) {
 
 static int backend_write(const char* s, DWORD len) {
     if (!g_backend.write) return 0;
+    return_to_live_view();
     return g_backend.write(&g_backend, s, len);
 }
 
@@ -593,10 +677,11 @@ static void paint_terminal(HWND hwnd, HDC dc) {
 
     EnterCriticalSection(&g_lock);
     for (int y = 0; y < g_rows; y++) {
+        const Cell* line = view_line_at(y);
         for (int x = 0; x < g_cols; x++) {
-            WCHAR ch = g_screen[y][x].ch;
-            COLORREF fg = g_screen[y][x].fg;
-            COLORREF bgc = g_screen[y][x].bg;
+            WCHAR ch = line[x].ch;
+            COLORREF fg = line[x].fg;
+            COLORREF bgc = line[x].bg;
             if (cell_is_selected(x, y)) {
                 fg = RGB(12, 16, 20);
                 bgc = RGB(140, 190, 255);
@@ -607,7 +692,7 @@ static void paint_terminal(HWND hwnd, HDC dc) {
         }
     }
 
-    {
+    if (g_scroll_offset == 0) {
         RECT cursor = {
             8 + g_cx * g_char_w,
             8 + g_cy * g_char_h,
@@ -697,8 +782,32 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
         }
+        if ((GetKeyState(VK_CONTROL) & 0x8000) && wp == VK_HOME) {
+            set_scroll_offset(g_history_count);
+            return 0;
+        }
+        if ((GetKeyState(VK_CONTROL) & 0x8000) && wp == VK_END) {
+            set_scroll_offset(0);
+            return 0;
+        }
+        if (wp == VK_PRIOR) {
+            scroll_view(g_rows - 1);
+            return 0;
+        }
+        if (wp == VK_NEXT) {
+            scroll_view(-(g_rows - 1));
+            return 0;
+        }
         if (!(GetKeyState(VK_CONTROL) & 0x8000) || !send_ctrl_key(wp)) {
             send_virtual_key(wp);
+        }
+        return 0;
+
+    case WM_MOUSEWHEEL:
+        if ((SHORT)HIWORD(wp) > 0) {
+            scroll_view(3);
+        } else if ((SHORT)HIWORD(wp) < 0) {
+            scroll_view(-3);
         }
         return 0;
 
