@@ -31,6 +31,9 @@
 #define HOST_ROW_H 22
 #define TAB_W 126
 #define MAX_SESSIONS 8
+#define MAX_HOSTS 16
+#define HOST_NAME_MAX 64
+#define HOST_COMMAND_MAX 256
 
 typedef struct {
     WCHAR ch;
@@ -39,8 +42,8 @@ typedef struct {
 } Cell;
 
 typedef struct {
-    const WCHAR* name;
-    const char* command;
+    WCHAR name[HOST_NAME_MAX];
+    char command[HOST_COMMAND_MAX];
 } HostEntry;
 
 typedef enum {
@@ -110,13 +113,8 @@ static int g_sel_focus_y = 0;
 static int g_word_anchor_start_x = 0;
 static int g_word_anchor_end_x = 0;
 static int g_word_anchor_y = 0;
-static const HostEntry g_hosts[] = {
-    { L"Local cmd", NULL },
-    { L"nybo-linux", "ssh nybo@nybo-loq-15irx10.lan\r" },
-    { L"web01", NULL },
-    { L"router", NULL }
-};
-#define HOST_COUNT ((int)(sizeof(g_hosts) / sizeof(g_hosts[0])))
+static HostEntry g_hosts[MAX_HOSTS];
+static int g_host_count = 0;
 static TermSession* g_sessions[MAX_SESSIONS];
 static int g_session_count = 0;
 static int g_active_session = -1;
@@ -239,6 +237,97 @@ static HICON create_app_icon(void) {
     DeleteObject(mask_bitmap);
     DeleteObject(color_bitmap);
     return icon;
+}
+
+static void strip_line_end(char* s) {
+    int len = (int)strlen(s);
+    while (len > 0 && (s[len - 1] == '\r' || s[len - 1] == '\n')) {
+        s[--len] = 0;
+    }
+}
+
+static void add_host_entry(const char* name, const char* command) {
+    HostEntry* host;
+    int wlen;
+
+    if (!name || !name[0] || g_host_count >= MAX_HOSTS) return;
+    host = &g_hosts[g_host_count++];
+    ZeroMemory(host, sizeof(*host));
+
+    wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                               name, -1, host->name, HOST_NAME_MAX);
+    if (wlen <= 0) {
+        MultiByteToWideChar(CP_ACP, 0, name, -1, host->name, HOST_NAME_MAX);
+    }
+    host->name[HOST_NAME_MAX - 1] = 0;
+    if (command) {
+        lstrcpynA(host->command, command, HOST_COMMAND_MAX);
+        host->command[HOST_COMMAND_MAX - 1] = 0;
+    }
+}
+
+static void add_default_hosts(void) {
+    g_host_count = 0;
+    add_host_entry("Local cmd", "");
+    add_host_entry("nybo-linux", "ssh nybo@nybo-loq-15irx10.lan");
+}
+
+static void load_hosts(void) {
+    HANDLE file;
+    DWORD size;
+    DWORD read = 0;
+    char* data;
+    char* line;
+    char* next;
+
+    g_host_count = 0;
+    file = CreateFileW(L"termu_hosts.txt", GENERIC_READ,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        add_default_hosts();
+        return;
+    }
+
+    size = GetFileSize(file, NULL);
+    if (size == INVALID_FILE_SIZE || size > 65536) {
+        CloseHandle(file);
+        add_default_hosts();
+        return;
+    }
+
+    data = (char*)malloc((size_t)size + 1);
+    if (!data) {
+        CloseHandle(file);
+        add_default_hosts();
+        return;
+    }
+
+    if (!ReadFile(file, data, size, &read, NULL)) read = 0;
+    CloseHandle(file);
+    data[read] = 0;
+
+    line = data;
+    while (line && *line) {
+        char* sep;
+        next = strchr(line, '\n');
+        if (next) *next++ = 0;
+        strip_line_end(line);
+        if (line[0] && line[0] != '#') {
+            sep = strchr(line, '|');
+            if (sep) {
+                *sep++ = 0;
+                strip_line_end(sep);
+                add_host_entry(line, sep);
+            } else {
+                add_host_entry(line, "");
+            }
+        }
+        line = next;
+    }
+    free(data);
+
+    if (g_host_count == 0) add_default_hosts();
 }
 
 static void open_output_log(void) {
@@ -903,7 +992,7 @@ static int host_at_point(int px, int py) {
     int row;
     if (px < 0 || px >= HOST_PANEL_W || py < 28) return -1;
     row = (py - 28) / HOST_ROW_H;
-    return row >= 0 && row < HOST_COUNT ? row : -1;
+    return row >= 0 && row < g_host_count ? row : -1;
 }
 
 static int tab_at_point(int px, int py) {
@@ -923,7 +1012,7 @@ static void handle_chrome_click(HWND hwnd, LPARAM lp) {
     SetFocus(hwnd);
     if (tab >= 0) {
         switch_session(tab);
-    } else if (host == 0 || (host > 0 && g_hosts[host].command)) {
+    } else if (host >= 0) {
         start_host_session(host);
     }
     InvalidateRect(hwnd, NULL, FALSE);
@@ -1236,14 +1325,29 @@ static void switch_session(int index) {
     InvalidateRect(g_hwnd, NULL, FALSE);
 }
 
+static void switch_relative_session(int delta) {
+    int next;
+    if (g_session_count <= 1 || g_active_session < 0) return;
+    next = (g_active_session + delta + g_session_count) % g_session_count;
+    switch_session(next);
+}
+
+static DWORD WINAPI cleanup_session_thread(void* arg) {
+    TermSession* session = (TermSession*)arg;
+    if (!session) return 0;
+    if (session->backend.stop) session->backend.stop(&session->backend);
+    free(session);
+    return 0;
+}
+
 static void close_session(int index) {
     TermSession* session;
+    HANDLE cleanup;
+    int old_active = g_active_session;
     if (index < 0 || index >= g_session_count || !g_sessions[index]) return;
 
     session = g_sessions[index];
-    g_session = session;
-    if (g_backend.stop) g_backend.stop(&g_backend);
-    free(session);
+    session->exited = 1;
 
     for (int i = index; i < g_session_count - 1; i++) {
         g_sessions[i] = g_sessions[i + 1];
@@ -1253,11 +1357,25 @@ static void close_session(int index) {
 
     if (g_session_count == 0) {
         set_active_session(-1);
-        PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
-        return;
+    } else if (old_active == index) {
+        if (index >= g_session_count) index = g_session_count - 1;
+        set_active_session(index);
+    } else if (old_active > index) {
+        set_active_session(old_active - 1);
+    } else {
+        set_active_session(old_active);
     }
-    if (index >= g_session_count) index = g_session_count - 1;
-    switch_session(index);
+
+    cleanup = CreateThread(NULL, 0, cleanup_session_thread, session, 0, NULL);
+    if (cleanup) CloseHandle(cleanup);
+
+    g_selection_active = 0;
+    update_window_title();
+    InvalidateRect(g_hwnd, NULL, FALSE);
+
+    if (g_session_count == 0) {
+        PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+    }
 }
 
 static int start_host_session(int host_index) {
@@ -1268,7 +1386,7 @@ static int start_host_session(int host_index) {
         switch_session(existing);
         return 1;
     }
-    if (host_index < 0 || host_index >= HOST_COUNT) return 0;
+    if (host_index < 0 || host_index >= g_host_count) return 0;
     if (g_session_count >= MAX_SESSIONS) {
         die_box(L"Maximum session count reached.");
         return 0;
@@ -1304,9 +1422,10 @@ static int start_host_session(int host_index) {
         set_active_session(g_session_count - 1);
         return 0;
     }
-    if (g_hosts[host_index].command) {
+    if (g_hosts[host_index].command[0]) {
         session->backend.write(&session->backend, g_hosts[host_index].command,
                                (DWORD)strlen(g_hosts[host_index].command));
+        session->backend.write(&session->backend, "\r", 1);
     }
     update_window_title();
     InvalidateRect(g_hwnd, NULL, FALSE);
@@ -1378,10 +1497,10 @@ static void paint_chrome(HWND hwnd, HDC dc, const RECT* term) {
     SetTextColor(dc, RGB(155, 166, 178));
     TextOutW(dc, 10, 5, L"Hosts", 5);
 
-    for (int i = 0; i < HOST_COUNT; i++) {
+    for (int i = 0; i < g_host_count; i++) {
         if (session_for_host(i) >= 0) {
             SetTextColor(dc, RGB(232, 238, 245));
-        } else if (g_hosts[i].command) {
+        } else if (g_hosts[i].command[0]) {
             SetTextColor(dc, RGB(200, 210, 220));
         } else {
             SetTextColor(dc, RGB(118, 128, 138));
@@ -1562,6 +1681,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 close_session(g_active_session);
                 return 0;
             }
+        }
+        if ((GetKeyState(VK_CONTROL) & 0x8000) && wp == VK_TAB) {
+            switch_relative_session((GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1);
+            return 0;
         }
         if ((GetKeyState(VK_CONTROL) & 0x8000) && wp == VK_HOME) {
             set_scroll_offset(g_history_count);
@@ -1746,6 +1869,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
     (void)cmdline;
     InitializeCriticalSection(&g_lock);
     g_app_icon = create_app_icon();
+    load_hosts();
 
     WNDCLASSW wc = {0};
     wc.style = CS_DBLCLKS;

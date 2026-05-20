@@ -1,0 +1,2 @@
+Local cmd|
+nybo-linux|ssh nybo@nybo-loq-15irx10.lan

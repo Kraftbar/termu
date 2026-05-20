@@ -56,18 +56,12 @@ static void conpty_cleanup_process_attrs(LPPROC_THREAD_ATTRIBUTE_LIST attrs) {
 
 static void conpty_close_resources(ConptyState* state) {
     InterlockedExchange(&state->stopping, 1);
-
-    if (state->pty_in) {
-        DWORD written = 0;
-        WriteFile(state->pty_in, "exit\r", 5, &written, NULL);
-    }
+    state->output = NULL;
+    state->output_user = NULL;
 
     if (state->child) {
-        DWORD wait = WaitForSingleObject(state->child, 800);
-        if (wait == WAIT_TIMEOUT) {
-            TerminateProcess(state->child, 0);
-            WaitForSingleObject(state->child, 800);
-        }
+        TerminateProcess(state->child, 0);
+        WaitForSingleObject(state->child, 150);
     }
 
     close_handle(&state->pty_in);
@@ -79,8 +73,9 @@ static void conpty_close_resources(ConptyState* state) {
     }
 
     if (state->reader_thread) {
-        WaitForSingleObject(state->reader_thread, 500);
-        close_handle(&state->reader_thread);
+        if (WaitForSingleObject(state->reader_thread, 150) == WAIT_OBJECT_0) {
+            close_handle(&state->reader_thread);
+        }
     }
 
     close_handle(&state->child);
@@ -215,8 +210,10 @@ static void conpty_stop(TermBackend* backend) {
     ConptyState* state = (ConptyState*)backend->state;
     if (!state) return;
     conpty_close_resources(state);
-    free(state);
-    backend->state = NULL;
+    if (!state->reader_thread) {
+        free(state);
+        backend->state = NULL;
+    }
 }
 
 int term_backend_conpty_init(TermBackend* backend) {
