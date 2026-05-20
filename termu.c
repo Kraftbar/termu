@@ -42,6 +42,7 @@ typedef enum {
 
 static HWND g_hwnd;
 static HFONT g_font;
+static HICON g_app_icon;
 static int g_char_w = 8;
 static int g_char_h = 16;
 static int g_rows = START_ROWS;
@@ -92,6 +93,66 @@ static void die_box(const WCHAR* text) {
 
 static int backend_write(const char* s, DWORD len);
 static int copy_selection_to_clipboard(void);
+
+static void fill_icon_rect(DWORD* pixels, int x, int y, int w, int h, DWORD color) {
+    for (int py = y; py < y + h; py++) {
+        for (int px = x; px < x + w; px++) {
+            if (px >= 0 && px < 32 && py >= 0 && py < 32) {
+                pixels[py * 32 + px] = color;
+            }
+        }
+    }
+}
+
+static HICON create_app_icon(void) {
+    BITMAPV5HEADER bi = {0};
+    ICONINFO ii = {0};
+    HDC dc;
+    HBITMAP color_bitmap;
+    HBITMAP mask_bitmap;
+    BYTE mask_bits[32 * 4] = {0};
+    DWORD* pixels = NULL;
+    HICON icon;
+
+    bi.bV5Size = sizeof(bi);
+    bi.bV5Width = 32;
+    bi.bV5Height = -32;
+    bi.bV5Planes = 1;
+    bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00ff0000;
+    bi.bV5GreenMask = 0x0000ff00;
+    bi.bV5BlueMask = 0x000000ff;
+    bi.bV5AlphaMask = 0xff000000;
+
+    dc = GetDC(NULL);
+    color_bitmap = CreateDIBSection(dc, (BITMAPINFO*)&bi, DIB_RGB_COLORS,
+                                    (void**)&pixels, NULL, 0);
+    ReleaseDC(NULL, dc);
+    if (!color_bitmap || !pixels) {
+        if (color_bitmap) DeleteObject(color_bitmap);
+        return NULL;
+    }
+
+    fill_icon_rect(pixels, 0, 0, 32, 32, 0xff07111fu);
+    fill_icon_rect(pixels, 4, 3, 24, 7, 0xff55b7ffu);
+    fill_icon_rect(pixels, 12, 10, 8, 18, 0xff55b7ffu);
+
+    mask_bitmap = CreateBitmap(32, 32, 1, 1, mask_bits);
+    if (!mask_bitmap) {
+        DeleteObject(color_bitmap);
+        return NULL;
+    }
+
+    ii.fIcon = TRUE;
+    ii.hbmColor = color_bitmap;
+    ii.hbmMask = mask_bitmap;
+    icon = CreateIconIndirect(&ii);
+
+    DeleteObject(mask_bitmap);
+    DeleteObject(color_bitmap);
+    return icon;
+}
 
 static void open_output_log(void) {
     g_output_log = CreateFileW(L"termu_output.log", GENERIC_WRITE,
@@ -1140,6 +1201,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
         g_hwnd = hwnd;
+        if (g_app_icon) {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)g_app_icon);
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)g_app_icon);
+        }
         g_font = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                              CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
@@ -1333,6 +1398,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_backend.stop) g_backend.stop(&g_backend);
         close_output_log();
         if (g_font) DeleteObject(g_font);
+        if (g_app_icon) {
+            DestroyIcon(g_app_icon);
+            g_app_icon = NULL;
+        }
         PostQuitMessage(0);
         return 0;
     }
@@ -1343,13 +1412,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
     (void)prev;
     (void)cmdline;
     InitializeCriticalSection(&g_lock);
+    g_app_icon = create_app_icon();
 
     WNDCLASSW wc = {0};
     wc.style = CS_DBLCLKS;
     wc.lpfnWndProc = wndproc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursor(NULL, IDC_IBEAM);
-    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wc.hIcon = g_app_icon ? g_app_icon : LoadIcon(NULL, IDI_APPLICATION);
     wc.lpszClassName = L"TermuWindow";
     wc.hbrBackground = NULL;
     if (!RegisterClassW(&wc)) return 1;
