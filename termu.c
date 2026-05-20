@@ -21,6 +21,8 @@
 #define MAX_HISTORY 4000
 #define START_ROWS 32
 #define START_COLS 100
+#define DEFAULT_FG RGB(230, 230, 230)
+#define DEFAULT_BG RGB(12, 16, 20)
 
 typedef struct {
     WCHAR ch;
@@ -46,6 +48,13 @@ static int g_cx = 0;
 static int g_cy = 0;
 static int g_saved_cx = 0;
 static int g_saved_cy = 0;
+static COLORREF g_cur_fg = DEFAULT_FG;
+static COLORREF g_cur_bg = DEFAULT_BG;
+static int g_cur_fg_index = -1;
+static int g_cur_bg_index = -1;
+static int g_cur_fg_bright = 0;
+static int g_cur_bg_bright = 0;
+static int g_bold = 0;
 static Cell g_screen[MAX_ROWS][MAX_COLS];
 static Cell g_history[MAX_HISTORY][MAX_COLS];
 static int g_history_start = 0;
@@ -97,8 +106,8 @@ static void log_backend_output(const char* data, DWORD len) {
 
 static void clear_cell(Cell* c) {
     c->ch = L' ';
-    c->fg = RGB(230, 230, 230);
-    c->bg = RGB(12, 16, 20);
+    c->fg = DEFAULT_FG;
+    c->bg = DEFAULT_BG;
 }
 
 static void clear_line(Cell* line) {
@@ -194,6 +203,32 @@ static void clear_line_from_cursor(void) {
     }
 }
 
+static void clear_line_to_cursor(void) {
+    for (int x = 0; x <= g_cx && x < g_cols; x++) {
+        clear_cell(&g_screen[g_cy][x]);
+    }
+}
+
+static void clear_entire_line(void) {
+    for (int x = 0; x < g_cols; x++) {
+        clear_cell(&g_screen[g_cy][x]);
+    }
+}
+
+static void clear_screen_from_cursor(void) {
+    clear_line_from_cursor();
+    for (int y = g_cy + 1; y < g_rows; y++) {
+        clear_line(g_screen[y]);
+    }
+}
+
+static void clear_screen_to_cursor(void) {
+    for (int y = 0; y < g_cy; y++) {
+        clear_line(g_screen[y]);
+    }
+    clear_line_to_cursor();
+}
+
 static void scroll_up(void) {
     push_history_line(g_screen[0]);
     for (int y = 1; y < g_rows; y++) {
@@ -229,8 +264,8 @@ static void put_wchar(WCHAR ch) {
 
     if (g_cx >= g_cols) newline();
     g_screen[g_cy][g_cx].ch = ch;
-    g_screen[g_cy][g_cx].fg = RGB(230, 230, 230);
-    g_screen[g_cy][g_cx].bg = RGB(12, 16, 20);
+    g_screen[g_cy][g_cx].fg = g_cur_fg;
+    g_screen[g_cy][g_cx].bg = g_cur_bg;
     g_cx++;
     if (g_cx >= g_cols) newline();
 }
@@ -246,11 +281,140 @@ static int parse_num(const char* s, int* i, int fallback) {
     return seen ? n : fallback;
 }
 
+static COLORREF ansi_color(int index, int bright) {
+    static const COLORREF normal[8] = {
+        RGB(0, 0, 0),
+        RGB(197, 15, 31),
+        RGB(19, 161, 14),
+        RGB(193, 156, 0),
+        RGB(0, 55, 218),
+        RGB(136, 23, 152),
+        RGB(58, 150, 221),
+        RGB(204, 204, 204)
+    };
+    static const COLORREF high[8] = {
+        RGB(118, 118, 118),
+        RGB(231, 72, 86),
+        RGB(22, 198, 12),
+        RGB(249, 241, 165),
+        RGB(59, 120, 255),
+        RGB(180, 0, 158),
+        RGB(97, 214, 214),
+        RGB(242, 242, 242)
+    };
+
+    if (index < 0 || index > 7) return DEFAULT_FG;
+    return bright ? high[index] : normal[index];
+}
+
+static void refresh_text_attrs(void) {
+    if (g_cur_fg_index >= 0) {
+        g_cur_fg = ansi_color(g_cur_fg_index, g_cur_fg_bright || g_bold);
+    } else {
+        g_cur_fg = DEFAULT_FG;
+    }
+
+    if (g_cur_bg_index >= 0) {
+        g_cur_bg = ansi_color(g_cur_bg_index, g_cur_bg_bright);
+    } else {
+        g_cur_bg = DEFAULT_BG;
+    }
+}
+
+static void reset_text_attrs(void) {
+    g_cur_fg_index = -1;
+    g_cur_bg_index = -1;
+    g_cur_fg_bright = 0;
+    g_cur_bg_bright = 0;
+    g_bold = 0;
+    refresh_text_attrs();
+}
+
+static void handle_sgr_param(int p) {
+    if (p == 0) {
+        reset_text_attrs();
+    } else if (p == 1) {
+        g_bold = 1;
+        refresh_text_attrs();
+    } else if (p == 22) {
+        g_bold = 0;
+        refresh_text_attrs();
+    } else if (p == 39) {
+        g_cur_fg_index = -1;
+        g_cur_fg_bright = 0;
+        refresh_text_attrs();
+    } else if (p == 49) {
+        g_cur_bg_index = -1;
+        g_cur_bg_bright = 0;
+        refresh_text_attrs();
+    } else if (p >= 30 && p <= 37) {
+        g_cur_fg_index = p - 30;
+        g_cur_fg_bright = 0;
+        refresh_text_attrs();
+    } else if (p >= 40 && p <= 47) {
+        g_cur_bg_index = p - 40;
+        g_cur_bg_bright = 0;
+        refresh_text_attrs();
+    } else if (p >= 90 && p <= 97) {
+        g_cur_fg_index = p - 90;
+        g_cur_fg_bright = 1;
+        refresh_text_attrs();
+    } else if (p >= 100 && p <= 107) {
+        g_cur_bg_index = p - 100;
+        g_cur_bg_bright = 1;
+        refresh_text_attrs();
+    }
+}
+
+static void handle_sgr(const char* seq, int len) {
+    int end = len > 0 ? len - 1 : 0;
+    int i = 0;
+    int saw_param = 0;
+
+    while (i < end) {
+        int p;
+        if (seq[i] == ';') {
+            p = 0;
+        } else {
+            p = parse_num(seq, &i, 0);
+        }
+
+        if (p == 38 || p == 48) {
+            int mode;
+            if (i < end && seq[i] == ';') i++;
+            mode = parse_num(seq, &i, 0);
+            if (mode == 5) {
+                if (i < end && seq[i] == ';') i++;
+                (void)parse_num(seq, &i, 0);
+            } else if (mode == 2) {
+                for (int n = 0; n < 3; n++) {
+                    if (i < end && seq[i] == ';') i++;
+                    (void)parse_num(seq, &i, 0);
+                }
+            }
+        } else {
+            handle_sgr_param(p);
+        }
+
+        saw_param = 1;
+        if (i < end && seq[i] == ';') i++;
+    }
+
+    if (!saw_param) {
+        reset_text_attrs();
+    }
+}
+
 static void handle_csi(const char* seq, int len) {
     int i = 0;
     int a = parse_num(seq, &i, 1);
     int b = 1;
     char cmd = len > 0 ? seq[len - 1] : 0;
+
+    if (cmd == 'm') {
+        handle_sgr(seq, len);
+        return;
+    }
 
     if (i < len && seq[i] == ';') {
         i++;
@@ -284,11 +448,16 @@ static void handle_csi(const char* seq, int len) {
         if (g_cx >= g_cols) g_cx = g_cols - 1;
         break;
     case 'J':
+        if (a == 0) clear_screen_from_cursor();
+        if (a == 1) clear_screen_to_cursor();
+        if (a == 2) clear_screen();
         if (a == 3) clear_scrollback();
-        if (a == 2 || a == 3) clear_screen();
+        if (a == 3) clear_screen();
         break;
     case 'K':
-        clear_line_from_cursor();
+        if (a == 0) clear_line_from_cursor();
+        if (a == 1) clear_line_to_cursor();
+        if (a == 2) clear_entire_line();
         break;
     case 's':
         g_saved_cx = g_cx;
@@ -395,7 +564,9 @@ static void feed_output(const char* bytes, DWORD count) {
             } else if (ch == L']') {
                 g_escape_state = ESC_OSC;
             } else if (ch == L'c') {
+                reset_text_attrs();
                 clear_screen();
+                clear_scrollback();
                 g_escape_state = ESC_NORMAL;
             } else {
                 g_escape_state = ESC_NORMAL;
