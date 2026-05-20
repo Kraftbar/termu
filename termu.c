@@ -68,7 +68,7 @@ static void die_box(const WCHAR* text) {
 static int backend_write(const char* s, DWORD len);
 
 static void open_output_log(void) {
-    g_output_log = CreateFileW(L"sw\\termu_output.log", GENERIC_WRITE,
+    g_output_log = CreateFileW(L"termu_output.log", GENERIC_WRITE,
                                FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (g_output_log == INVALID_HANDLE_VALUE) {
