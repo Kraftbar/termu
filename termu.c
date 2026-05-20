@@ -41,8 +41,6 @@ typedef enum {
 
 static HWND g_hwnd;
 static HFONT g_font;
-static int g_owns_font = 0;
-static int g_font_px = 16;
 static int g_char_w = 8;
 static int g_char_h = 16;
 static int g_rows = START_ROWS;
@@ -85,13 +83,6 @@ static void die_box(const WCHAR* text) {
 }
 
 static int backend_write(const char* s, DWORD len);
-static void resize_grid(HWND hwnd);
-
-static HFONT create_terminal_font(void) {
-    return CreateFontW(-g_font_px, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                       CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
-}
 
 static void open_output_log(void) {
     g_output_log = CreateFileW(L"termu_output.log", GENERIC_WRITE,
@@ -863,40 +854,6 @@ static void resize_grid(HWND hwnd) {
     }
 }
 
-static void set_font_size(HWND hwnd, int px) {
-    HFONT next_font;
-    if (px < 10) px = 10;
-    if (px > 32) px = 32;
-    if (px == g_font_px) return;
-
-    g_font_px = px;
-    next_font = create_terminal_font();
-    if (!next_font) return;
-
-    if (g_font && g_owns_font) DeleteObject(g_font);
-    g_font = next_font;
-    g_owns_font = 1;
-    update_metrics(hwnd);
-    resize_grid(hwnd);
-    InvalidateRect(hwnd, NULL, FALSE);
-}
-
-static int handle_font_zoom(HWND hwnd, WPARAM vk) {
-    if (vk == VK_OEM_PLUS || vk == VK_ADD) {
-        set_font_size(hwnd, g_font_px + 1);
-        return 1;
-    }
-    if (vk == VK_OEM_MINUS || vk == VK_SUBTRACT) {
-        set_font_size(hwnd, g_font_px - 1);
-        return 1;
-    }
-    if (vk == '0' || vk == VK_NUMPAD0) {
-        set_font_size(hwnd, 16);
-        return 1;
-    }
-    return 0;
-}
-
 static void paint_terminal(HWND hwnd, HDC dc) {
     RECT rc;
     HBRUSH bg;
@@ -1012,12 +969,11 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
         g_hwnd = hwnd;
-        g_font = create_terminal_font();
+        g_font = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
         if (!g_font) {
             g_font = (HFONT)GetStockObject(ANSI_FIXED_FONT);
-            g_owns_font = 0;
-        } else {
-            g_owns_font = 1;
         }
         update_metrics(hwnd);
         resize_grid(hwnd);
@@ -1062,9 +1018,6 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             if (wp == 'W') {
                 PostMessageW(hwnd, WM_CLOSE, 0, 0);
-                return 0;
-            }
-            if (handle_font_zoom(hwnd, wp)) {
                 return 0;
             }
         }
@@ -1176,7 +1129,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         KillTimer(hwnd, TIMER_REPAINT);
         if (g_backend.stop) g_backend.stop(&g_backend);
         close_output_log();
-        if (g_font && g_owns_font) DeleteObject(g_font);
+        if (g_font) DeleteObject(g_font);
         PostQuitMessage(0);
         return 0;
     }
