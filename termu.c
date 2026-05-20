@@ -86,6 +86,7 @@ static void die_box(const WCHAR* text) {
 }
 
 static int backend_write(const char* s, DWORD len);
+static int copy_selection_to_clipboard(void);
 
 static void open_output_log(void) {
     g_output_log = CreateFileW(L"termu_output.log", GENERIC_WRITE,
@@ -713,6 +714,41 @@ static int cell_is_selected(int x, int y) {
     return 1;
 }
 
+static int word_char(WCHAR ch) {
+    return ch > L' ' && ch != 0;
+}
+
+static int select_word_at(int x, int y) {
+    const Cell* line;
+    int start;
+    int end;
+
+    if (x < 0 || x >= g_cols || y < 0 || y >= g_rows) return 0;
+
+    EnterCriticalSection(&g_lock);
+    line = view_line_at(y);
+    if (!word_char(line[x].ch)) {
+        LeaveCriticalSection(&g_lock);
+        return 0;
+    }
+
+    start = x;
+    end = x;
+    while (start > 0 && word_char(line[start - 1].ch)) start--;
+    while (end + 1 < g_cols && word_char(line[end + 1].ch)) end++;
+    LeaveCriticalSection(&g_lock);
+
+    g_sel_anchor_x = start;
+    g_sel_anchor_y = y;
+    g_sel_focus_x = end;
+    g_sel_focus_y = y;
+    g_selection_active = 1;
+    g_selecting = 0;
+    copy_selection_to_clipboard();
+    InvalidateRect(g_hwnd, NULL, FALSE);
+    return 1;
+}
+
 static int copy_selection_to_clipboard(void) {
     int sx, sy, ex, ey;
     int capacity;
@@ -1134,6 +1170,18 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
 
+    case WM_LBUTTONDBLCLK: {
+        int x;
+        int y;
+        if (g_selecting) {
+            g_selecting = 0;
+            ReleaseCapture();
+        }
+        mouse_to_cell(lp, &x, &y);
+        select_word_at(x, y);
+        return 0;
+    }
+
     case WM_RBUTTONDOWN:
         paste_clipboard_text();
         return 0;
@@ -1183,6 +1231,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
     InitializeCriticalSection(&g_lock);
 
     WNDCLASSW wc = {0};
+    wc.style = CS_DBLCLKS;
     wc.lpfnWndProc = wndproc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursor(NULL, IDC_IBEAM);
