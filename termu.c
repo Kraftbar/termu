@@ -3,6 +3,9 @@
 // Version: 0.2 - backend abstraction plus local Windows ConPTY backend.
 
 #define _WIN32_WINNT 0x0A00
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
 #ifdef _MSC_VER
@@ -49,6 +52,13 @@
 #define HOST_PASSWORD_MAX 256
 #define HOST_PASSWORD_BLOB_MAX 2048
 #define MAX_DISCOVERED 64
+#define SCAN_WORKERS 16
+
+typedef struct {
+    int prefix[3];
+    volatile LONG next_host;
+    volatile LONG active_workers;
+} ScanState;
 
 typedef struct {
     WCHAR ch;
@@ -63,7 +73,7 @@ typedef struct {
 } HostEntry;
 
 typedef struct {
-    WCHAR label[32];
+    WCHAR label[96];
     char ip[16];
 } DiscoveredHost;
 
@@ -144,6 +154,7 @@ static int g_host_count = 0;
 static DiscoveredHost g_discovered[MAX_DISCOVERED];
 static int g_discovered_count = 0;
 static volatile LONG g_scan_running = 0;
+static CRITICAL_SECTION g_scan_lock;
 static TermSession* g_sessions[MAX_SESSIONS];
 static int g_session_count = 0;
 static int g_active_session = -1;
@@ -514,49 +525,109 @@ static DWORD ipaddr_from_octets(int a, int b, int c, int d) {
     return (DWORD)(a | (b << 8) | (c << 16) | (d << 24));
 }
 
-static void add_discovered_ip(int a, int b, int c, int d) {
-    DiscoveredHost* host;
-    if (g_discovered_count >= MAX_DISCOVERED) return;
-    host = &g_discovered[g_discovered_count];
-    snprintf(host->ip, sizeof(host->ip), "%d.%d.%d.%d", a, b, c, d);
-    MultiByteToWideChar(CP_ACP, 0, host->ip, -1, host->label,
-                        (int)(sizeof(host->label) / sizeof(host->label[0])));
-    g_discovered_count++;
+static void resolve_discovered_label(const char* ip, WCHAR* label, int label_cap) {
+    DWORD addr = inet_addr(ip);
+    struct hostent* host = NULL;
+    if (addr != INADDR_NONE) {
+        host = gethostbyaddr((const char*)&addr, sizeof(addr), AF_INET);
+    }
+    if (host && host->h_name && host->h_name[0]) {
+        MultiByteToWideChar(CP_ACP, 0, host->h_name, -1, label, label_cap);
+        label[label_cap - 1] = 0;
+    } else {
+        MultiByteToWideChar(CP_ACP, 0, ip, -1, label, label_cap);
+    }
 }
 
-static DWORD WINAPI lan_scan_thread(void* ignored) {
-    int prefix[3];
+static void add_discovered_ip(int a, int b, int c, int d) {
+    DiscoveredHost* host;
+    char ip[16];
+    WCHAR label[96];
+
+    snprintf(ip, sizeof(ip), "%d.%d.%d.%d", a, b, c, d);
+    resolve_discovered_label(ip, label, (int)(sizeof(label) / sizeof(label[0])));
+
+    EnterCriticalSection(&g_scan_lock);
+    if (g_discovered_count >= MAX_DISCOVERED) {
+        LeaveCriticalSection(&g_scan_lock);
+        return;
+    }
+    host = &g_discovered[g_discovered_count];
+    lstrcpynA(host->ip, ip, (int)sizeof(host->ip));
+    lstrcpynW(host->label, label, (int)(sizeof(host->label) / sizeof(host->label[0])));
+    g_discovered_count++;
+    LeaveCriticalSection(&g_scan_lock);
+}
+
+static DWORD WINAPI lan_scan_worker_thread(void* arg) {
+    ScanState* scan = (ScanState*)arg;
     HANDLE icmp;
     char payload = 0;
     BYTE reply[sizeof(ICMP_ECHO_REPLY) + 32];
 
+    icmp = IcmpCreateFile();
+    if (icmp != INVALID_HANDLE_VALUE) {
+        for (;;) {
+            int host = (int)InterlockedIncrement(&scan->next_host);
+            DWORD ip;
+            DWORD replies;
+            if (host > 254) break;
+            ip = ipaddr_from_octets(scan->prefix[0], scan->prefix[1], scan->prefix[2], host);
+            replies = IcmpSendEcho(icmp, ip, &payload, sizeof(payload), NULL,
+                                   reply, sizeof(reply), 60);
+            if (replies > 0) {
+                add_discovered_ip(scan->prefix[0], scan->prefix[1], scan->prefix[2], host);
+                PostMessageW(g_hwnd, WM_SCAN_DONE, 0, 0);
+            }
+        }
+        IcmpCloseHandle(icmp);
+    }
+
+    if (InterlockedDecrement(&scan->active_workers) == 0) {
+        InterlockedExchange(&g_scan_running, 0);
+        PostMessageW(g_hwnd, WM_SCAN_DONE, 0, 0);
+        free(scan);
+    }
+    return 0;
+}
+
+static DWORD WINAPI lan_scan_thread(void* ignored) {
+    ScanState* scan;
+    int prefix[3];
+
     (void)ignored;
+    EnterCriticalSection(&g_scan_lock);
     g_discovered_count = 0;
+    LeaveCriticalSection(&g_scan_lock);
+
     if (!find_lan_prefix(prefix)) {
         InterlockedExchange(&g_scan_running, 0);
         PostMessageW(g_hwnd, WM_SCAN_DONE, 0, 0);
         return 0;
     }
 
-    icmp = IcmpCreateFile();
-    if (icmp == INVALID_HANDLE_VALUE) {
+    scan = (ScanState*)calloc(1, sizeof(*scan));
+    if (!scan) {
         InterlockedExchange(&g_scan_running, 0);
         PostMessageW(g_hwnd, WM_SCAN_DONE, 0, 0);
         return 0;
     }
+    scan->prefix[0] = prefix[0];
+    scan->prefix[1] = prefix[1];
+    scan->prefix[2] = prefix[2];
+    scan->next_host = 0;
+    scan->active_workers = SCAN_WORKERS;
 
-    for (int host = 1; host <= 254; host++) {
-        DWORD ip = ipaddr_from_octets(prefix[0], prefix[1], prefix[2], host);
-        DWORD replies = IcmpSendEcho(icmp, ip, &payload, sizeof(payload), NULL,
-                                     reply, sizeof(reply), 45);
-        if (replies > 0) {
-            add_discovered_ip(prefix[0], prefix[1], prefix[2], host);
-            PostMessageW(g_hwnd, WM_SCAN_DONE, 0, 0);
+    for (int i = 0; i < SCAN_WORKERS; i++) {
+        HANDLE worker = CreateThread(NULL, 0, lan_scan_worker_thread, scan, 0, NULL);
+        if (worker) {
+            CloseHandle(worker);
+        } else if (InterlockedDecrement(&scan->active_workers) == 0) {
+            InterlockedExchange(&g_scan_running, 0);
+            free(scan);
+            break;
         }
     }
-
-    IcmpCloseHandle(icmp);
-    InterlockedExchange(&g_scan_running, 0);
     PostMessageW(g_hwnd, WM_SCAN_DONE, 0, 0);
     return 0;
 }
@@ -1874,9 +1945,12 @@ static void paint_chrome(HWND hwnd, HDC dc, const RECT* term) {
         TextOutW(dc, 10, y, L"Discovered", 10);
         y += HOST_ROW_H;
         for (int i = 0; i < g_discovered_count; i++) {
+            RECT row;
+            SetRect(&row, 14, y + i * HOST_ROW_H, HOST_PANEL_W - 8,
+                    y + (i + 1) * HOST_ROW_H);
             SetTextColor(dc, RGB(180, 190, 200));
-            TextOutW(dc, 14, y + i * HOST_ROW_H,
-                     g_discovered[i].label, lstrlenW(g_discovered[i].label));
+            DrawTextW(dc, g_discovered[i].label, -1, &row,
+                      DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
         }
     }
 
@@ -2250,6 +2324,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
     (void)prev;
     (void)cmdline;
     InitializeCriticalSection(&g_lock);
+    InitializeCriticalSection(&g_scan_lock);
+    {
+        WSADATA wsa;
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+    }
     g_app_icon = create_app_icon();
     load_hosts();
 
@@ -2287,6 +2366,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
         }
 
         DeleteCriticalSection(&g_lock);
+        DeleteCriticalSection(&g_scan_lock);
+        WSACleanup();
         return (int)msg.wParam;
     }
 }
