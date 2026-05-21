@@ -8,6 +8,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
+#include <wincred.h>
 #ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable: 4115)
@@ -415,6 +416,76 @@ static void save_hosts(void) {
         WriteFile(file, line, (DWORD)strlen(line), &written, NULL);
     }
     CloseHandle(file);
+}
+
+static int wide_to_utf8(const WCHAR* src, char* dst, int dst_cap) {
+    int len = WideCharToMultiByte(CP_UTF8, 0, src, -1, dst, dst_cap, NULL, NULL);
+    if (len <= 0) {
+        len = WideCharToMultiByte(CP_ACP, 0, src, -1, dst, dst_cap, NULL, NULL);
+    }
+    if (len <= 0) {
+        if (dst_cap > 0) dst[0] = 0;
+        return 0;
+    }
+    dst[dst_cap - 1] = 0;
+    return 1;
+}
+
+static int add_discovered_host_prompt(int discovered_index) {
+    DiscoveredHost* discovered;
+    CREDUI_INFOW info;
+    WCHAR user[128] = L"";
+    WCHAR password[128] = L"";
+    BOOL save = FALSE;
+    DWORD result;
+    char user_utf8[128];
+    char pass_utf8[128];
+    char label_utf8[HOST_NAME_MAX * 4];
+    char name[HOST_NAME_MAX * 4];
+    char command[HOST_COMMAND_MAX];
+    char blob[HOST_PASSWORD_BLOB_MAX];
+    HostEntry* host;
+
+    if (discovered_index < 0 || discovered_index >= g_discovered_count) return -1;
+    if (g_host_count >= MAX_HOSTS) {
+        die_box(L"Maximum host count reached.");
+        return -1;
+    }
+
+    discovered = &g_discovered[discovered_index];
+    ZeroMemory(&info, sizeof(info));
+    info.cbSize = sizeof(info);
+    info.hwndParent = g_hwnd;
+    info.pszCaptionText = L"Add SSH Host";
+    info.pszMessageText = discovered->label;
+
+    result = CredUIPromptForCredentialsW(&info, discovered->label, NULL, 0,
+                                         user, 128, password, 128, &save,
+                                         CREDUI_FLAGS_GENERIC_CREDENTIALS |
+                                         CREDUI_FLAGS_ALWAYS_SHOW_UI |
+                                         CREDUI_FLAGS_DO_NOT_PERSIST |
+                                         CREDUI_FLAGS_EXPECT_CONFIRMATION);
+    if (result != NO_ERROR || !user[0]) return -1;
+
+    if (!wide_to_utf8(user, user_utf8, sizeof(user_utf8))) return -1;
+    if (!wide_to_utf8(password, pass_utf8, sizeof(pass_utf8))) pass_utf8[0] = 0;
+    if (wide_to_utf8(discovered->label, label_utf8, sizeof(label_utf8)) &&
+        strcmp(label_utf8, discovered->ip) != 0) {
+        snprintf(name, sizeof(name), "%s", label_utf8);
+    } else {
+        snprintf(name, sizeof(name), "%s@%s", user_utf8, discovered->ip);
+    }
+    snprintf(command, sizeof(command), "ssh %s@%s", user_utf8, discovered->ip);
+
+    blob[0] = 0;
+    if (pass_utf8[0]) protect_password(pass_utf8, blob, sizeof(blob));
+    SecureZeroMemory(pass_utf8, sizeof(pass_utf8));
+    SecureZeroMemory(password, sizeof(password));
+
+    host = add_host_entry(name, command, blob);
+    if (!host) return -1;
+    save_hosts();
+    return g_host_count - 1;
 }
 
 static void load_hosts(void) {
@@ -1416,9 +1487,8 @@ static void handle_chrome_click(HWND hwnd, LPARAM lp) {
     } else if (point_is_scan_row(px, py)) {
         start_lan_scan();
     } else if (discovered >= 0) {
-        char command[HOST_COMMAND_MAX];
-        snprintf(command, sizeof(command), "ssh %s", g_discovered[discovered].ip);
-        start_command_session(g_discovered[discovered].label, command, -1);
+        int host_index = add_discovered_host_prompt(discovered);
+        if (host_index >= 0) start_host_session(host_index);
     }
     InvalidateRect(hwnd, NULL, FALSE);
 }
