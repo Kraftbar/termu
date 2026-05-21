@@ -4,6 +4,15 @@
 
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
+#include <iphlpapi.h>
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4115)
+#endif
+#include <icmpapi.h>
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 #include <wincrypt.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +27,7 @@
 #define APP_NAME L"Termu v0.2"
 #define WM_BACKEND_DATA (WM_APP + 1)
 #define WM_BACKEND_EXIT (WM_APP + 2)
+#define WM_SCAN_DONE (WM_APP + 3)
 #define TIMER_REPAINT 1
 #define MAX_ROWS 80
 #define MAX_COLS 160
@@ -38,6 +48,7 @@
 #define HOST_COMMAND_MAX 256
 #define HOST_PASSWORD_MAX 256
 #define HOST_PASSWORD_BLOB_MAX 2048
+#define MAX_DISCOVERED 64
 
 typedef struct {
     WCHAR ch;
@@ -50,6 +61,11 @@ typedef struct {
     char command[HOST_COMMAND_MAX];
     char password_blob[HOST_PASSWORD_BLOB_MAX];
 } HostEntry;
+
+typedef struct {
+    WCHAR label[32];
+    char ip[16];
+} DiscoveredHost;
 
 typedef enum {
     ESC_NORMAL,
@@ -125,6 +141,9 @@ static int g_word_anchor_end_x = 0;
 static int g_word_anchor_y = 0;
 static HostEntry g_hosts[MAX_HOSTS];
 static int g_host_count = 0;
+static DiscoveredHost g_discovered[MAX_DISCOVERED];
+static int g_discovered_count = 0;
+static volatile LONG g_scan_running = 0;
 static TermSession* g_sessions[MAX_SESSIONS];
 static int g_session_count = 0;
 static int g_active_session = -1;
@@ -164,6 +183,8 @@ static void die_box(const WCHAR* text) {
 static int backend_write(const char* s, DWORD len);
 static int copy_selection_to_clipboard(void);
 static int start_host_session(int host_index);
+static int start_command_session(const WCHAR* name, const char* command, int host_index);
+static void start_lan_scan(void);
 static void switch_session(int index);
 static void close_session(int index);
 
@@ -445,6 +466,99 @@ static void load_hosts(void) {
     free(data);
 
     if (g_host_count == 0) add_default_hosts();
+}
+
+static int parse_ipv4(const char* s, int octets[4]) {
+    int n = sscanf(s, "%d.%d.%d.%d", &octets[0], &octets[1], &octets[2], &octets[3]);
+    if (n != 4) return 0;
+    for (int i = 0; i < 4; i++) {
+        if (octets[i] < 0 || octets[i] > 255) return 0;
+    }
+    return 1;
+}
+
+static int find_lan_prefix(int prefix[3]) {
+    ULONG size = 0;
+    IP_ADAPTER_INFO* adapters;
+    DWORD rc = GetAdaptersInfo(NULL, &size);
+    if (rc != ERROR_BUFFER_OVERFLOW || size == 0) return 0;
+
+    adapters = (IP_ADAPTER_INFO*)malloc(size);
+    if (!adapters) return 0;
+    rc = GetAdaptersInfo(adapters, &size);
+    if (rc == ERROR_SUCCESS) {
+        for (IP_ADAPTER_INFO* adapter = adapters; adapter; adapter = adapter->Next) {
+            IP_ADDR_STRING* addr = &adapter->IpAddressList;
+            while (addr) {
+                int ip[4];
+                int mask[4];
+                if (parse_ipv4(addr->IpAddress.String, ip) &&
+                    parse_ipv4(addr->IpMask.String, mask) &&
+                    ip[0] != 0 && ip[0] != 127 &&
+                    mask[0] == 255 && mask[1] == 255 && mask[2] == 255 && mask[3] == 0) {
+                    prefix[0] = ip[0];
+                    prefix[1] = ip[1];
+                    prefix[2] = ip[2];
+                    free(adapters);
+                    return 1;
+                }
+                addr = addr->Next;
+            }
+        }
+    }
+    free(adapters);
+    return 0;
+}
+
+static DWORD ipaddr_from_octets(int a, int b, int c, int d) {
+    return (DWORD)(a | (b << 8) | (c << 16) | (d << 24));
+}
+
+static void add_discovered_ip(int a, int b, int c, int d) {
+    DiscoveredHost* host;
+    if (g_discovered_count >= MAX_DISCOVERED) return;
+    host = &g_discovered[g_discovered_count];
+    snprintf(host->ip, sizeof(host->ip), "%d.%d.%d.%d", a, b, c, d);
+    MultiByteToWideChar(CP_ACP, 0, host->ip, -1, host->label,
+                        (int)(sizeof(host->label) / sizeof(host->label[0])));
+    g_discovered_count++;
+}
+
+static DWORD WINAPI lan_scan_thread(void* ignored) {
+    int prefix[3];
+    HANDLE icmp;
+    char payload = 0;
+    BYTE reply[sizeof(ICMP_ECHO_REPLY) + 32];
+
+    (void)ignored;
+    g_discovered_count = 0;
+    if (!find_lan_prefix(prefix)) {
+        InterlockedExchange(&g_scan_running, 0);
+        PostMessageW(g_hwnd, WM_SCAN_DONE, 0, 0);
+        return 0;
+    }
+
+    icmp = IcmpCreateFile();
+    if (icmp == INVALID_HANDLE_VALUE) {
+        InterlockedExchange(&g_scan_running, 0);
+        PostMessageW(g_hwnd, WM_SCAN_DONE, 0, 0);
+        return 0;
+    }
+
+    for (int host = 1; host <= 254; host++) {
+        DWORD ip = ipaddr_from_octets(prefix[0], prefix[1], prefix[2], host);
+        DWORD replies = IcmpSendEcho(icmp, ip, &payload, sizeof(payload), NULL,
+                                     reply, sizeof(reply), 45);
+        if (replies > 0) {
+            add_discovered_ip(prefix[0], prefix[1], prefix[2], host);
+            PostMessageW(g_hwnd, WM_SCAN_DONE, 0, 0);
+        }
+    }
+
+    IcmpCloseHandle(icmp);
+    InterlockedExchange(&g_scan_running, 0);
+    PostMessageW(g_hwnd, WM_SCAN_DONE, 0, 0);
+    return 0;
 }
 
 static void open_output_log(void) {
@@ -1191,6 +1305,23 @@ static int host_at_point(int px, int py) {
     return row >= 0 && row < g_host_count ? row : -1;
 }
 
+static int scan_row_y(void) {
+    return 31 + g_host_count * HOST_ROW_H + 8;
+}
+
+static int point_is_scan_row(int px, int py) {
+    int y = scan_row_y();
+    return px >= 0 && px < HOST_PANEL_W && py >= y && py < y + HOST_ROW_H;
+}
+
+static int discovered_at_point(int px, int py) {
+    int first_y = scan_row_y() + HOST_ROW_H + 24;
+    int row;
+    if (px < 0 || px >= HOST_PANEL_W || py < first_y) return -1;
+    row = (py - first_y) / HOST_ROW_H;
+    return row >= 0 && row < g_discovered_count ? row : -1;
+}
+
 static int tab_at_point(int px, int py) {
     int tab;
     if (py < 0 || py >= TAB_BAR_H || px < HOST_PANEL_W + 8) return -1;
@@ -1203,6 +1334,7 @@ static void handle_chrome_click(HWND hwnd, LPARAM lp) {
     int py = (int)(short)HIWORD(lp);
     int host = host_at_point(px, py);
     int tab = tab_at_point(px, py);
+    int discovered = discovered_at_point(px, py);
 
     g_selection_active = 0;
     SetFocus(hwnd);
@@ -1210,6 +1342,12 @@ static void handle_chrome_click(HWND hwnd, LPARAM lp) {
         switch_session(tab);
     } else if (host >= 0) {
         start_host_session(host);
+    } else if (point_is_scan_row(px, py)) {
+        start_lan_scan();
+    } else if (discovered >= 0) {
+        char command[HOST_COMMAND_MAX];
+        snprintf(command, sizeof(command), "ssh %s", g_discovered[discovered].ip);
+        start_command_session(g_discovered[discovered].label, command, -1);
     }
     InvalidateRect(hwnd, NULL, FALSE);
 }
@@ -1575,15 +1713,8 @@ static void close_session(int index) {
     }
 }
 
-static int start_host_session(int host_index) {
+static int start_command_session(const WCHAR* name, const char* command, int host_index) {
     TermSession* session;
-    int existing = session_for_host(host_index);
-
-    if (existing >= 0) {
-        switch_session(existing);
-        return 1;
-    }
-    if (host_index < 0 || host_index >= g_host_count) return 0;
     if (g_session_count >= MAX_SESSIONS) {
         die_box(L"Maximum session count reached.");
         return 0;
@@ -1593,7 +1724,7 @@ static int start_host_session(int host_index) {
     if (!session) return 0;
     session->host_index = host_index;
     session->cursor_visible = 1;
-    lstrcpynW(session->name, g_hosts[host_index].name,
+    lstrcpynW(session->name, name,
               (int)(sizeof(session->name) / sizeof(session->name[0])));
 
     g_sessions[g_session_count] = session;
@@ -1619,14 +1750,39 @@ static int start_host_session(int host_index) {
         set_active_session(g_session_count - 1);
         return 0;
     }
-    if (g_hosts[host_index].command[0]) {
-        session->backend.write(&session->backend, g_hosts[host_index].command,
-                               (DWORD)strlen(g_hosts[host_index].command));
+    if (command && command[0]) {
+        session->backend.write(&session->backend, command, (DWORD)strlen(command));
         session->backend.write(&session->backend, "\r", 1);
     }
     update_window_title();
     InvalidateRect(g_hwnd, NULL, FALSE);
     return 1;
+}
+
+static int start_host_session(int host_index) {
+    int existing = session_for_host(host_index);
+
+    if (existing >= 0) {
+        switch_session(existing);
+        return 1;
+    }
+    if (host_index < 0 || host_index >= g_host_count) return 0;
+    return start_command_session(g_hosts[host_index].name,
+                                 g_hosts[host_index].command,
+                                 host_index);
+}
+
+static void start_lan_scan(void) {
+    HANDLE thread;
+    if (InterlockedCompareExchange(&g_scan_running, 1, 0) != 0) return;
+    g_discovered_count = 0;
+    thread = CreateThread(NULL, 0, lan_scan_thread, NULL, 0, NULL);
+    if (thread) {
+        CloseHandle(thread);
+    } else {
+        InterlockedExchange(&g_scan_running, 0);
+    }
+    InvalidateRect(g_hwnd, NULL, FALSE);
 }
 
 static void update_metrics(HWND hwnd) {
@@ -1704,6 +1860,24 @@ static void paint_chrome(HWND hwnd, HDC dc, const RECT* term) {
         }
         TextOutW(dc, 14, 31 + i * HOST_ROW_H,
                  g_hosts[i].name, lstrlenW(g_hosts[i].name));
+    }
+
+    {
+        int y = scan_row_y();
+        const WCHAR* scan_label = InterlockedCompareExchange(&g_scan_running, 0, 0)
+                                  ? L"Scan LAN..." : L"Scan LAN";
+        SetTextColor(dc, RGB(200, 210, 220));
+        TextOutW(dc, 14, y, scan_label, lstrlenW(scan_label));
+
+        y += HOST_ROW_H + 8;
+        SetTextColor(dc, RGB(155, 166, 178));
+        TextOutW(dc, 10, y, L"Discovered", 10);
+        y += HOST_ROW_H;
+        for (int i = 0; i < g_discovered_count; i++) {
+            SetTextColor(dc, RGB(180, 190, 200));
+            TextOutW(dc, 14, y + i * HOST_ROW_H,
+                     g_discovered[i].label, lstrlenW(g_discovered[i].label));
+        }
     }
 
     for (int i = 0; i < g_session_count; i++) {
@@ -2023,6 +2197,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ((TermSession*)lp)->exited = 1;
             InvalidateRect(hwnd, NULL, FALSE);
         }
+        return 0;
+
+    case WM_SCAN_DONE:
+        InvalidateRect(hwnd, NULL, FALSE);
         return 0;
 
     case WM_ERASEBKGND:
