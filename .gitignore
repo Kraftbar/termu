@@ -1,5 +1,6 @@
 *.obj
 *.exe
 *.log
+termu_hosts.txt
 .agents/
 .codex/
