@@ -33,6 +33,9 @@
 #define WM_BACKEND_EXIT (WM_APP + 2)
 #define WM_SCAN_DONE (WM_APP + 3)
 #define TIMER_REPAINT 1
+#define IDM_HOST_CONNECT 1001
+#define IDM_HOST_PASSWORD 1002
+#define IDM_HOST_DELETE 1003
 #define MAX_ROWS 80
 #define MAX_COLS 160
 #define MAX_HISTORY 4000
@@ -49,11 +52,15 @@
 #define MAX_SESSIONS 8
 #define MAX_HOSTS 16
 #define HOST_NAME_MAX 64
+#define HOST_TARGET_MAX 128
+#define HOST_USER_MAX 64
 #define HOST_COMMAND_MAX 256
 #define HOST_PASSWORD_MAX 256
 #define HOST_PASSWORD_BLOB_MAX 2048
 #define MAX_DISCOVERED 64
 #define SCAN_WORKERS 16
+#define HOST_TYPE_LOCAL 0
+#define HOST_TYPE_SSH 1
 
 typedef struct {
     int prefix[3];
@@ -69,7 +76,10 @@ typedef struct {
 
 typedef struct {
     WCHAR name[HOST_NAME_MAX];
-    char command[HOST_COMMAND_MAX];
+    int type;
+    char host[HOST_TARGET_MAX];
+    char user[HOST_USER_MAX];
+    int port;
     char password_blob[HOST_PASSWORD_BLOB_MAX];
 } HostEntry;
 
@@ -363,24 +373,44 @@ static int unprotect_password(const char* blob, char* password, int password_cap
     return 1;
 }
 
-static HostEntry* add_host_entry(const char* name, const char* command,
-                                 const char* password_blob) {
-    HostEntry* host;
-    int wlen;
-
-    if (!name || !name[0] || g_host_count >= MAX_HOSTS) return NULL;
-    host = &g_hosts[g_host_count++];
-    ZeroMemory(host, sizeof(*host));
-
-    wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-                               name, -1, host->name, HOST_NAME_MAX);
+static void set_host_name(HostEntry* host, const char* name) {
+    int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                   name, -1, host->name, HOST_NAME_MAX);
     if (wlen <= 0) {
         MultiByteToWideChar(CP_ACP, 0, name, -1, host->name, HOST_NAME_MAX);
     }
     host->name[HOST_NAME_MAX - 1] = 0;
-    if (command) {
-        lstrcpynA(host->command, command, HOST_COMMAND_MAX);
-        host->command[HOST_COMMAND_MAX - 1] = 0;
+}
+
+static HostEntry* add_local_host_entry(const char* name) {
+    HostEntry* host;
+
+    if (!name || !name[0] || g_host_count >= MAX_HOSTS) return NULL;
+    host = &g_hosts[g_host_count++];
+    ZeroMemory(host, sizeof(*host));
+    host->type = HOST_TYPE_LOCAL;
+    set_host_name(host, name);
+    return host;
+}
+
+static HostEntry* add_ssh_host_entry(const char* name, const char* host_name,
+                                     int port, const char* user,
+                                     const char* password_blob) {
+    HostEntry* host;
+
+    if (!name || !name[0] || !host_name || !host_name[0] || g_host_count >= MAX_HOSTS) {
+        return NULL;
+    }
+    host = &g_hosts[g_host_count++];
+    ZeroMemory(host, sizeof(*host));
+    host->type = HOST_TYPE_SSH;
+    host->port = port > 0 ? port : 22;
+    set_host_name(host, name);
+    lstrcpynA(host->host, host_name, HOST_TARGET_MAX);
+    host->host[HOST_TARGET_MAX - 1] = 0;
+    if (user) {
+        lstrcpynA(host->user, user, HOST_USER_MAX);
+        host->user[HOST_USER_MAX - 1] = 0;
     }
     if (password_blob) {
         lstrcpynA(host->password_blob, password_blob, HOST_PASSWORD_BLOB_MAX);
@@ -391,8 +421,8 @@ static HostEntry* add_host_entry(const char* name, const char* command,
 
 static void add_default_hosts(void) {
     g_host_count = 0;
-    add_host_entry("Local cmd", "", "");
-    add_host_entry("nybo-linux", "ssh nybo@nybo-loq-15irx10.lan", "");
+    add_local_host_entry("Local cmd");
+    add_ssh_host_entry("nybo-linux", "nybo-loq-15irx10.lan", 22, "nybo", "");
 }
 
 static void save_hosts(void) {
@@ -402,16 +432,18 @@ static void save_hosts(void) {
 
     for (int i = 0; i < g_host_count; i++) {
         char name[HOST_NAME_MAX * 4];
-        char line[HOST_NAME_MAX * 4 + HOST_COMMAND_MAX + HOST_PASSWORD_BLOB_MAX + 8];
+        char line[HOST_NAME_MAX * 4 + HOST_TARGET_MAX + HOST_USER_MAX +
+                  HOST_PASSWORD_BLOB_MAX + 48];
         DWORD written = 0;
         int name_len = WideCharToMultiByte(CP_UTF8, 0, g_hosts[i].name, -1,
                                            name, sizeof(name), NULL, NULL);
         if (name_len <= 0) continue;
-        if (g_hosts[i].password_blob[0]) {
-            snprintf(line, sizeof(line), "%s|%s|%s\r\n",
-                     name, g_hosts[i].command, g_hosts[i].password_blob);
+        if (g_hosts[i].type == HOST_TYPE_SSH) {
+            snprintf(line, sizeof(line), "ssh|%s|%s|%d|%s|%s\r\n",
+                     name, g_hosts[i].host, g_hosts[i].port,
+                     g_hosts[i].user, g_hosts[i].password_blob);
         } else {
-            snprintf(line, sizeof(line), "%s|%s\r\n", name, g_hosts[i].command);
+            snprintf(line, sizeof(line), "local|%s\r\n", name);
         }
         WriteFile(file, line, (DWORD)strlen(line), &written, NULL);
     }
@@ -431,19 +463,67 @@ static int wide_to_utf8(const WCHAR* src, char* dst, int dst_cap) {
     return 1;
 }
 
+static void prefill_user_port(WCHAR* dst, int dst_cap, const char* user, int port) {
+    WCHAR user_w[96] = L"";
+
+    if (dst_cap <= 0) return;
+    if (user && user[0]) {
+        MultiByteToWideChar(CP_UTF8, 0, user, -1, user_w,
+                            (int)(sizeof(user_w) / sizeof(user_w[0])));
+    }
+    user_w[(sizeof(user_w) / sizeof(user_w[0])) - 1] = 0;
+    if (user_w[0]) {
+        swprintf(dst, dst_cap, L"%ls:%d", user_w, port > 0 ? port : 22);
+    } else {
+        dst[0] = 0;
+    }
+    dst[dst_cap - 1] = 0;
+}
+
+static int parse_user_port(char* value, char* user, int user_cap,
+                           int fallback_port, int* port) {
+    char* colon;
+    int parsed_port = fallback_port > 0 ? fallback_port : 22;
+
+    if (!value || !user || user_cap <= 0 || !port) return 0;
+    colon = strrchr(value, ':');
+    if (colon) {
+        char* p = colon + 1;
+        int n = 0;
+        if (*p) {
+            while (*p) {
+                if (*p < '0' || *p > '9') return 0;
+                n = n * 10 + (*p - '0');
+                if (n > 65535) return 0;
+                p++;
+            }
+            if (n <= 0) return 0;
+            parsed_port = n;
+        }
+        *colon = 0;
+    }
+    if (!value[0]) return 0;
+    lstrcpynA(user, value, user_cap);
+    user[user_cap - 1] = 0;
+    *port = parsed_port;
+    return 1;
+}
+
 static int add_discovered_host_prompt(int discovered_index) {
     DiscoveredHost* discovered;
     CREDUI_INFOW info;
+    WCHAR message[128];
     WCHAR user[128] = L"";
     WCHAR password[128] = L"";
     BOOL save = FALSE;
     DWORD result;
     char user_utf8[128];
+    char parsed_user[HOST_USER_MAX];
     char pass_utf8[128];
     char label_utf8[HOST_NAME_MAX * 4];
     char name[HOST_NAME_MAX * 4];
-    char command[HOST_COMMAND_MAX];
     char blob[HOST_PASSWORD_BLOB_MAX];
+    int port = 22;
     HostEntry* host;
 
     if (discovered_index < 0 || discovered_index >= g_discovered_count) return -1;
@@ -454,12 +534,16 @@ static int add_discovered_host_prompt(int discovered_index) {
 
     discovered = &g_discovered[discovered_index];
     ZeroMemory(&info, sizeof(info));
+    swprintf(message, sizeof(message) / sizeof(message[0]),
+             L"%ls  port 22; type user or user:port", discovered->label);
+    message[(sizeof(message) / sizeof(message[0])) - 1] = 0;
+    prefill_user_port(user, (int)(sizeof(user) / sizeof(user[0])), NULL, 22);
     info.cbSize = sizeof(info);
     info.hwndParent = g_hwnd;
     info.pszCaptionText = L"Add SSH Host";
-    info.pszMessageText = discovered->label;
+    info.pszMessageText = message;
 
-    result = CredUIPromptForCredentialsW(&info, discovered->label, NULL, 0,
+    result = CredUIPromptForCredentialsW(&info, message, NULL, 0,
                                          user, 128, password, 128, &save,
                                          CREDUI_FLAGS_GENERIC_CREDENTIALS |
                                          CREDUI_FLAGS_ALWAYS_SHOW_UI |
@@ -468,24 +552,140 @@ static int add_discovered_host_prompt(int discovered_index) {
     if (result != NO_ERROR || !user[0]) return -1;
 
     if (!wide_to_utf8(user, user_utf8, sizeof(user_utf8))) return -1;
+    if (!parse_user_port(user_utf8, parsed_user, sizeof(parsed_user), 22, &port)) {
+        die_box(L"Enter the SSH user as user:port, for example nybo:22.");
+        return -1;
+    }
     if (!wide_to_utf8(password, pass_utf8, sizeof(pass_utf8))) pass_utf8[0] = 0;
     if (wide_to_utf8(discovered->label, label_utf8, sizeof(label_utf8)) &&
         strcmp(label_utf8, discovered->ip) != 0) {
         snprintf(name, sizeof(name), "%s", label_utf8);
     } else {
-        snprintf(name, sizeof(name), "%s@%s", user_utf8, discovered->ip);
+        snprintf(name, sizeof(name), "%s@%s", parsed_user, discovered->ip);
     }
-    snprintf(command, sizeof(command), "ssh %s@%s", user_utf8, discovered->ip);
 
     blob[0] = 0;
     if (pass_utf8[0]) protect_password(pass_utf8, blob, sizeof(blob));
     SecureZeroMemory(pass_utf8, sizeof(pass_utf8));
     SecureZeroMemory(password, sizeof(password));
 
-    host = add_host_entry(name, command, blob);
+    host = add_ssh_host_entry(name, discovered->ip, port, parsed_user, blob);
     if (!host) return -1;
     save_hosts();
     return g_host_count - 1;
+}
+
+static int prompt_host_password(int host_index) {
+    CREDUI_INFOW info;
+    WCHAR message[160];
+    WCHAR user[128] = L"";
+    WCHAR password[128] = L"";
+    BOOL save = FALSE;
+    DWORD result;
+    char user_utf8[128];
+    char parsed_user[HOST_USER_MAX];
+    char pass_utf8[128];
+    int port;
+
+    if (host_index < 0 || host_index >= g_host_count) return 0;
+    if (g_hosts[host_index].type != HOST_TYPE_SSH) return 0;
+
+    prefill_user_port(user, (int)(sizeof(user) / sizeof(user[0])),
+                      g_hosts[host_index].user, g_hosts[host_index].port);
+
+    ZeroMemory(&info, sizeof(info));
+    swprintf(message, sizeof(message) / sizeof(message[0]),
+             L"%ls:%d", g_hosts[host_index].name, g_hosts[host_index].port);
+    message[(sizeof(message) / sizeof(message[0])) - 1] = 0;
+    info.cbSize = sizeof(info);
+    info.hwndParent = g_hwnd;
+    info.pszCaptionText = L"Re-enter Password";
+    info.pszMessageText = message;
+
+    result = CredUIPromptForCredentialsW(&info, message, NULL, 0,
+                                         user, 128, password, 128, &save,
+                                         CREDUI_FLAGS_GENERIC_CREDENTIALS |
+                                         CREDUI_FLAGS_ALWAYS_SHOW_UI |
+                                         CREDUI_FLAGS_DO_NOT_PERSIST);
+    if (result != NO_ERROR || !password[0]) return 0;
+
+    if (!wide_to_utf8(password, pass_utf8, sizeof(pass_utf8))) {
+        SecureZeroMemory(password, sizeof(password));
+        return 0;
+    }
+    if (wide_to_utf8(user, user_utf8, sizeof(user_utf8)) && user_utf8[0]) {
+        if (!parse_user_port(user_utf8, parsed_user, sizeof(parsed_user),
+                             g_hosts[host_index].port, &port)) {
+            SecureZeroMemory(pass_utf8, sizeof(pass_utf8));
+            SecureZeroMemory(password, sizeof(password));
+            die_box(L"Enter the SSH user as user:port, for example nybo:22.");
+            return 0;
+        }
+        lstrcpynA(g_hosts[host_index].user, parsed_user, HOST_USER_MAX);
+        g_hosts[host_index].user[HOST_USER_MAX - 1] = 0;
+        g_hosts[host_index].port = port;
+    }
+    if (!protect_password(pass_utf8, g_hosts[host_index].password_blob,
+                          HOST_PASSWORD_BLOB_MAX)) {
+        SecureZeroMemory(pass_utf8, sizeof(pass_utf8));
+        SecureZeroMemory(password, sizeof(password));
+        die_box(L"Could not protect the password.");
+        return 0;
+    }
+
+    SecureZeroMemory(pass_utf8, sizeof(pass_utf8));
+    SecureZeroMemory(password, sizeof(password));
+    save_hosts();
+    return 1;
+}
+
+static void delete_host(int host_index) {
+    WCHAR message[HOST_NAME_MAX + 64];
+
+    if (host_index < 0 || host_index >= g_host_count) return;
+    if (g_host_count <= 1 || g_hosts[host_index].type != HOST_TYPE_SSH) return;
+
+    swprintf(message, sizeof(message) / sizeof(message[0]),
+             L"Delete saved host \"%ls\"?", g_hosts[host_index].name);
+    message[(sizeof(message) / sizeof(message[0])) - 1] = 0;
+    if (MessageBoxW(g_hwnd, message, APP_NAME,
+                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+        return;
+    }
+
+    for (int i = 0; i < g_session_count; i++) {
+        if (!g_sessions[i]) continue;
+        if (g_sessions[i]->host_index == host_index) {
+            g_sessions[i]->host_index = -1;
+        } else if (g_sessions[i]->host_index > host_index) {
+            g_sessions[i]->host_index--;
+        }
+    }
+    for (int i = host_index; i < g_host_count - 1; i++) {
+        g_hosts[i] = g_hosts[i + 1];
+    }
+    g_host_count--;
+    ZeroMemory(&g_hosts[g_host_count], sizeof(g_hosts[g_host_count]));
+    save_hosts();
+}
+
+static int split_fields(char* line, char** fields, int max_fields) {
+    int count = 0;
+    char* p = line;
+
+    while (p && count < max_fields) {
+        char* sep;
+        fields[count++] = p;
+        sep = strchr(p, '|');
+        if (sep) {
+            *sep = 0;
+            p = sep + 1;
+        } else {
+            p = NULL;
+        }
+    }
+    for (int i = 0; i < count; i++) strip_line_end(fields[i]);
+    return count;
 }
 
 static void load_hosts(void) {
@@ -525,22 +725,21 @@ static void load_hosts(void) {
 
     line = data;
     while (line && *line) {
-        char* sep;
+        char* fields[6];
+        int field_count;
         next = strchr(line, '\n');
         if (next) *next++ = 0;
         strip_line_end(line);
         if (line[0] && line[0] != '#') {
-            sep = strchr(line, '|');
-            if (sep) {
-                char* password_blob;
-                *sep++ = 0;
-                password_blob = strchr(sep, '|');
-                if (password_blob) *password_blob++ = 0;
-                strip_line_end(sep);
-                if (password_blob) strip_line_end(password_blob);
-                add_host_entry(line, sep, password_blob ? password_blob : "");
-            } else {
-                add_host_entry(line, "", "");
+            field_count = split_fields(line, fields, 6);
+            if (field_count >= 2 && strcmp(fields[0], "local") == 0) {
+                add_local_host_entry(fields[1]);
+            } else if (field_count >= 5 && strcmp(fields[0], "ssh") == 0) {
+                int port = atoi(fields[3]);
+                add_ssh_host_entry(fields[1], fields[2],
+                                   port > 0 ? port : 22,
+                                   fields[4],
+                                   field_count >= 6 ? fields[5] : "");
             }
         }
         line = next;
@@ -1042,10 +1241,15 @@ static void handle_sgr(const char* seq, int len) {
     int i = 0;
     int saw_param = 0;
 
+    if (end > 0 && seq[0] != ';' && (seq[0] < '0' || seq[0] > '9')) return;
+
     while (i < end) {
         int p;
         if (seq[i] == ';') {
             p = 0;
+        } else if (seq[i] < '0' || seq[i] > '9') {
+            i++;
+            continue;
         } else {
             p = parse_num(seq, &i, 0);
         }
@@ -1266,10 +1470,12 @@ static void finish_password_capture(void) {
     if (g_session->host_index >= 0 && g_session->host_index < g_host_count &&
         g_session->password_input_len > 0) {
         host = &g_hosts[g_session->host_index];
-        g_session->password_input[g_session->password_input_len] = 0;
-        if (protect_password(g_session->password_input, host->password_blob,
-                             HOST_PASSWORD_BLOB_MAX)) {
-            save_hosts();
+        if (host->type == HOST_TYPE_SSH) {
+            g_session->password_input[g_session->password_input_len] = 0;
+            if (protect_password(g_session->password_input, host->password_blob,
+                                 HOST_PASSWORD_BLOB_MAX)) {
+                save_hosts();
+            }
         }
     }
 
@@ -1303,7 +1509,7 @@ static void maybe_handle_password_prompt(TermSession* session, const char* bytes
 
     if (!session || session->host_index < 0 || session->host_index >= g_host_count) return;
     host = &g_hosts[session->host_index];
-    if (!host->command[0]) return;
+    if (host->type != HOST_TYPE_SSH) return;
 
     for (DWORD i = 0; i < count; i++) {
         char c = bytes[i];
@@ -1902,15 +2108,27 @@ static int start_command_session(const WCHAR* name, const char* command, int hos
 
 static int start_host_session(int host_index) {
     int existing = session_for_host(host_index);
+    char command[HOST_COMMAND_MAX];
 
     if (existing >= 0) {
         switch_session(existing);
         return 1;
     }
     if (host_index < 0 || host_index >= g_host_count) return 0;
-    return start_command_session(g_hosts[host_index].name,
-                                 g_hosts[host_index].command,
-                                 host_index);
+    command[0] = 0;
+    if (g_hosts[host_index].type == HOST_TYPE_SSH) {
+        if (g_hosts[host_index].user[0]) {
+            snprintf(command, sizeof(command), "ssh -p %d %s@%s",
+                     g_hosts[host_index].port,
+                     g_hosts[host_index].user,
+                     g_hosts[host_index].host);
+        } else {
+            snprintf(command, sizeof(command), "ssh -p %d %s",
+                     g_hosts[host_index].port,
+                     g_hosts[host_index].host);
+        }
+    }
+    return start_command_session(g_hosts[host_index].name, command, host_index);
 }
 
 static void start_lan_scan(void) {
@@ -1924,6 +2142,47 @@ static void start_lan_scan(void) {
         InterlockedExchange(&g_scan_running, 0);
     }
     InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
+static void show_host_context_menu(HWND hwnd, int host_index, LPARAM lp) {
+    HMENU menu;
+    POINT pt;
+    UINT disabled = MF_GRAYED;
+    int command;
+
+    if (host_index < 0 || host_index >= g_host_count) return;
+
+    menu = CreatePopupMenu();
+    if (!menu) return;
+
+    if (g_hosts[host_index].type == HOST_TYPE_SSH) disabled = 0;
+    AppendMenuW(menu, MF_STRING, IDM_HOST_CONNECT, L"Connect");
+    AppendMenuW(menu, MF_STRING | disabled, IDM_HOST_PASSWORD, L"Re-enter password");
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING | (disabled || g_host_count <= 1 ? MF_GRAYED : 0),
+                IDM_HOST_DELETE, L"Delete");
+
+    pt.x = (int)(short)LOWORD(lp);
+    pt.y = (int)(short)HIWORD(lp);
+    ClientToScreen(hwnd, &pt);
+    command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                             pt.x, pt.y, 0, hwnd, NULL);
+    DestroyMenu(menu);
+
+    switch (command) {
+    case IDM_HOST_CONNECT:
+        start_host_session(host_index);
+        break;
+    case IDM_HOST_PASSWORD:
+        prompt_host_password(host_index);
+        break;
+    case IDM_HOST_DELETE:
+        delete_host(host_index);
+        break;
+    default:
+        break;
+    }
+    InvalidateRect(hwnd, NULL, FALSE);
 }
 
 static void update_metrics(HWND hwnd) {
@@ -1994,7 +2253,7 @@ static void paint_chrome(HWND hwnd, HDC dc, const RECT* term) {
     for (int i = 0; i < g_host_count; i++) {
         if (session_for_host(i) >= 0) {
             SetTextColor(dc, RGB(232, 238, 245));
-        } else if (g_hosts[i].command[0]) {
+        } else if (g_hosts[i].type == HOST_TYPE_SSH) {
             SetTextColor(dc, RGB(200, 210, 220));
         } else {
             SetTextColor(dc, RGB(118, 128, 138));
@@ -2145,6 +2404,9 @@ static int send_ctrl_navigation_key(WPARAM vk) {
 
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_GETDLGCODE:
+        return DLGC_WANTALLKEYS;
+
     case WM_CREATE:
         g_hwnd = hwnd;
         if (g_app_icon) {
@@ -2323,6 +2585,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_RBUTTONDOWN:
         if (point_in_terminal(hwnd, lp)) {
             paste_clipboard_text();
+        } else {
+            int host = host_at_point((int)(short)LOWORD(lp),
+                                     (int)(short)HIWORD(lp));
+            if (host >= 0) show_host_context_menu(hwnd, host, lp);
         }
         return 0;
 

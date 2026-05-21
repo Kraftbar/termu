@@ -23,9 +23,8 @@ the user what changed and what specific behavior to check.
 
 `termu.c` owns the UI. `backend_conpty.c` owns local `cmd.exe` ConPTY I/O.
 Add SSH later as another `TermBackend`; keep SFTP/SCP separate from terminal I/O.
-Hosts load from local-only `termu_hosts.txt` as `name|command`; use
-`termu_hosts.example.txt` as the tracked template. Saved passwords are DPAPI
-blobs in an optional third field and should stay uncommitted.
+Hosts load from local-only `termu_hosts.txt`; use `termu_hosts.example.txt` as
+the tracked template. Saved passwords are DPAPI blobs and should stay uncommitted.
 `Scan LAN` does a runtime-only IPv4 `/24` ICMP sweep; clicking a result can save it.
 Defer font zoom and last-line flicker work for now; both are tricky rabbit holes.
 

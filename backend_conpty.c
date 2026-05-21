@@ -99,9 +99,13 @@ static DWORD WINAPI conpty_reader_thread(void* arg) {
 
 static int build_cmdline(WCHAR* cmdline, DWORD chars) {
     DWORD len = GetEnvironmentVariableW(L"ComSpec", cmdline, chars);
-    if (len > 0 && len < chars) return 1;
-    if (chars < 8) return 0;
+    if (len > 0 && len + 7 < chars) {
+        lstrcatW(cmdline, L" /F:ON");
+        return 1;
+    }
+    if (chars < 14) return 0;
     lstrcpyW(cmdline, L"cmd.exe");
+    lstrcatW(cmdline, L" /F:ON");
     return 1;
 }
 
