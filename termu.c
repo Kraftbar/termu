@@ -4,6 +4,8 @@
 
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
+#include <wincrypt.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -34,6 +36,8 @@
 #define MAX_HOSTS 16
 #define HOST_NAME_MAX 64
 #define HOST_COMMAND_MAX 256
+#define HOST_PASSWORD_MAX 256
+#define HOST_PASSWORD_BLOB_MAX 2048
 
 typedef struct {
     WCHAR ch;
@@ -44,6 +48,7 @@ typedef struct {
 typedef struct {
     WCHAR name[HOST_NAME_MAX];
     char command[HOST_COMMAND_MAX];
+    char password_blob[HOST_PASSWORD_BLOB_MAX];
 } HostEntry;
 
 typedef enum {
@@ -85,6 +90,11 @@ typedef struct {
     int csi_len;
     WCHAR osc_buf[MAX_OSC];
     int osc_len;
+    char prompt_tail[64];
+    int prompt_tail_len;
+    int password_capture;
+    char password_input[HOST_PASSWORD_MAX];
+    int password_input_len;
 } TermSession;
 
 typedef struct {
@@ -246,11 +256,86 @@ static void strip_line_end(char* s) {
     }
 }
 
-static void add_host_entry(const char* name, const char* command) {
+static int hex_value(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int hex_encode(const BYTE* data, DWORD len, char* out, int out_cap) {
+    static const char digits[] = "0123456789abcdef";
+    if ((DWORD)out_cap <= len * 2) return 0;
+    for (DWORD i = 0; i < len; i++) {
+        out[i * 2] = digits[data[i] >> 4];
+        out[i * 2 + 1] = digits[data[i] & 15];
+    }
+    out[len * 2] = 0;
+    return 1;
+}
+
+static int hex_decode(const char* hex, BYTE* out, DWORD out_cap, DWORD* out_len) {
+    DWORD len = (DWORD)strlen(hex);
+    if ((len % 2) != 0 || len / 2 > out_cap) return 0;
+    for (DWORD i = 0; i < len / 2; i++) {
+        int hi = hex_value(hex[i * 2]);
+        int lo = hex_value(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return 0;
+        out[i] = (BYTE)((hi << 4) | lo);
+    }
+    *out_len = len / 2;
+    return 1;
+}
+
+static int protect_password(const char* password, char* out, int out_cap) {
+    DATA_BLOB in;
+    DATA_BLOB protected_blob;
+    int ok;
+
+    if (!password || !password[0] || out_cap <= 6) return 0;
+    in.pbData = (BYTE*)password;
+    in.cbData = (DWORD)strlen(password);
+    if (!CryptProtectData(&in, L"Termu host password", NULL, NULL, NULL, 0,
+                          &protected_blob)) {
+        return 0;
+    }
+    lstrcpynA(out, "dpapi:", out_cap);
+    ok = hex_encode(protected_blob.pbData, protected_blob.cbData,
+                    out + 6, out_cap - 6);
+    LocalFree(protected_blob.pbData);
+    if (!ok) out[0] = 0;
+    return ok;
+}
+
+static int unprotect_password(const char* blob, char* password, int password_cap) {
+    BYTE encrypted[HOST_PASSWORD_BLOB_MAX / 2];
+    DWORD encrypted_len = 0;
+    DATA_BLOB in;
+    DATA_BLOB plain;
+    DWORD copy_len;
+
+    if (!blob || strncmp(blob, "dpapi:", 6) != 0) return 0;
+    if (!hex_decode(blob + 6, encrypted, sizeof(encrypted), &encrypted_len)) return 0;
+
+    in.pbData = encrypted;
+    in.cbData = encrypted_len;
+    if (!CryptUnprotectData(&in, NULL, NULL, NULL, NULL, 0, &plain)) return 0;
+
+    copy_len = plain.cbData;
+    if (copy_len >= (DWORD)password_cap) copy_len = (DWORD)password_cap - 1;
+    memcpy(password, plain.pbData, copy_len);
+    password[copy_len] = 0;
+    SecureZeroMemory(plain.pbData, plain.cbData);
+    LocalFree(plain.pbData);
+    return 1;
+}
+
+static HostEntry* add_host_entry(const char* name, const char* command,
+                                 const char* password_blob) {
     HostEntry* host;
     int wlen;
 
-    if (!name || !name[0] || g_host_count >= MAX_HOSTS) return;
+    if (!name || !name[0] || g_host_count >= MAX_HOSTS) return NULL;
     host = &g_hosts[g_host_count++];
     ZeroMemory(host, sizeof(*host));
 
@@ -264,12 +349,40 @@ static void add_host_entry(const char* name, const char* command) {
         lstrcpynA(host->command, command, HOST_COMMAND_MAX);
         host->command[HOST_COMMAND_MAX - 1] = 0;
     }
+    if (password_blob) {
+        lstrcpynA(host->password_blob, password_blob, HOST_PASSWORD_BLOB_MAX);
+        host->password_blob[HOST_PASSWORD_BLOB_MAX - 1] = 0;
+    }
+    return host;
 }
 
 static void add_default_hosts(void) {
     g_host_count = 0;
-    add_host_entry("Local cmd", "");
-    add_host_entry("nybo-linux", "ssh nybo@nybo-loq-15irx10.lan");
+    add_host_entry("Local cmd", "", "");
+    add_host_entry("nybo-linux", "ssh nybo@nybo-loq-15irx10.lan", "");
+}
+
+static void save_hosts(void) {
+    HANDLE file = CreateFileW(L"termu_hosts.txt", GENERIC_WRITE, 0, NULL,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return;
+
+    for (int i = 0; i < g_host_count; i++) {
+        char name[HOST_NAME_MAX * 4];
+        char line[HOST_NAME_MAX * 4 + HOST_COMMAND_MAX + HOST_PASSWORD_BLOB_MAX + 8];
+        DWORD written = 0;
+        int name_len = WideCharToMultiByte(CP_UTF8, 0, g_hosts[i].name, -1,
+                                           name, sizeof(name), NULL, NULL);
+        if (name_len <= 0) continue;
+        if (g_hosts[i].password_blob[0]) {
+            snprintf(line, sizeof(line), "%s|%s|%s\r\n",
+                     name, g_hosts[i].command, g_hosts[i].password_blob);
+        } else {
+            snprintf(line, sizeof(line), "%s|%s\r\n", name, g_hosts[i].command);
+        }
+        WriteFile(file, line, (DWORD)strlen(line), &written, NULL);
+    }
+    CloseHandle(file);
 }
 
 static void load_hosts(void) {
@@ -316,11 +429,15 @@ static void load_hosts(void) {
         if (line[0] && line[0] != '#') {
             sep = strchr(line, '|');
             if (sep) {
+                char* password_blob;
                 *sep++ = 0;
+                password_blob = strchr(sep, '|');
+                if (password_blob) *password_blob++ = 0;
                 strip_line_end(sep);
-                add_host_entry(line, sep);
+                if (password_blob) strip_line_end(password_blob);
+                add_host_entry(line, sep, password_blob ? password_blob : "");
             } else {
-                add_host_entry(line, "");
+                add_host_entry(line, "", "");
             }
         }
         line = next;
@@ -885,12 +1002,91 @@ static int decode_output_bytes(const char* bytes, DWORD count, WCHAR* wbuf, int 
     return wlen;
 }
 
+static void finish_password_capture(void) {
+    HostEntry* host;
+    if (!g_session || !g_session->password_capture) return;
+    g_session->password_capture = 0;
+
+    if (g_session->host_index >= 0 && g_session->host_index < g_host_count &&
+        g_session->password_input_len > 0) {
+        host = &g_hosts[g_session->host_index];
+        g_session->password_input[g_session->password_input_len] = 0;
+        if (protect_password(g_session->password_input, host->password_blob,
+                             HOST_PASSWORD_BLOB_MAX)) {
+            save_hosts();
+        }
+    }
+
+    SecureZeroMemory(g_session->password_input, sizeof(g_session->password_input));
+    g_session->password_input_len = 0;
+}
+
+static void capture_password_bytes(const char* bytes, int len) {
+    if (!g_session || !g_session->password_capture || !bytes || len <= 0) return;
+    for (int i = 0; i < len; i++) {
+        if (bytes[i] == '\r' || bytes[i] == '\n') {
+            finish_password_capture();
+            return;
+        }
+        if (g_session->password_input_len < HOST_PASSWORD_MAX - 1) {
+            g_session->password_input[g_session->password_input_len++] = bytes[i];
+        }
+    }
+}
+
+static void capture_password_backspace(void) {
+    if (!g_session || !g_session->password_capture) return;
+    if (g_session->password_input_len > 0) {
+        g_session->password_input[--g_session->password_input_len] = 0;
+    }
+}
+
+static void maybe_handle_password_prompt(TermSession* session, const char* bytes, DWORD count) {
+    HostEntry* host;
+    char password[HOST_PASSWORD_MAX];
+
+    if (!session || session->host_index < 0 || session->host_index >= g_host_count) return;
+    host = &g_hosts[session->host_index];
+    if (!host->command[0]) return;
+
+    for (DWORD i = 0; i < count; i++) {
+        char c = bytes[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c < 32 && c != '\r' && c != '\n' && c != '\t') continue;
+        if (session->prompt_tail_len >= (int)sizeof(session->prompt_tail) - 1) {
+            memmove(session->prompt_tail, session->prompt_tail + 1,
+                    sizeof(session->prompt_tail) - 2);
+            session->prompt_tail_len = (int)sizeof(session->prompt_tail) - 2;
+        }
+        session->prompt_tail[session->prompt_tail_len++] = c;
+        session->prompt_tail[session->prompt_tail_len] = 0;
+    }
+
+    if (!strstr(session->prompt_tail, "password:")) return;
+    session->prompt_tail_len = 0;
+    session->prompt_tail[0] = 0;
+
+    if (host->password_blob[0] &&
+        unprotect_password(host->password_blob, password, sizeof(password))) {
+        if (session->backend.write) {
+            session->backend.write(&session->backend, password, (DWORD)strlen(password));
+            session->backend.write(&session->backend, "\r", 1);
+        }
+        SecureZeroMemory(password, sizeof(password));
+    } else {
+        session->password_capture = 1;
+        session->password_input_len = 0;
+        SecureZeroMemory(session->password_input, sizeof(session->password_input));
+    }
+}
+
 static void feed_output(TermSession* session, const char* bytes, DWORD count) {
     TermSession* old_session = g_session;
     WCHAR wbuf[8192];
     int wlen;
     if (!session) return;
     g_session = session;
+    maybe_handle_password_prompt(session, bytes, count);
     wlen = decode_output_bytes(bytes, count, wbuf, 8192);
     if (wlen <= 0) {
         g_session = old_session;
@@ -1271,6 +1467,7 @@ static int paste_clipboard_text(void) {
     }
     WideCharToMultiByte(CP_UTF8, 0, normalized, norm_len, utf8, utf8_len, NULL, NULL);
     free(normalized);
+    capture_password_bytes(utf8, utf8_len);
     backend_write(utf8, (DWORD)utf8_len);
     free(utf8);
     return 1;
@@ -1658,12 +1855,16 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_CHAR:
         if (wp == L'\r') {
+            finish_password_capture();
             backend_write("\r", 1);
         } else if (wp >= 32) {
             WCHAR wc = (WCHAR)wp;
             char utf8[8];
             int len = WideCharToMultiByte(CP_UTF8, 0, &wc, 1, utf8, sizeof(utf8), NULL, NULL);
-            if (len > 0) backend_write(utf8, (DWORD)len);
+            if (len > 0) {
+                capture_password_bytes(utf8, len);
+                backend_write(utf8, (DWORD)len);
+            }
         }
         return 0;
 
@@ -1696,6 +1897,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if ((GetKeyState(VK_CONTROL) & 0x8000) && send_ctrl_navigation_key(wp)) {
             return 0;
+        }
+        if (wp == VK_BACK) {
+            capture_password_backspace();
         }
         if (wp == VK_PRIOR) {
             scroll_view(g_rows - 1);
